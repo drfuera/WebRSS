@@ -27,10 +27,10 @@ A self-hosted, single-file RSS/Atom reader. No database, no build step, no depen
 2. Make sure the web server user can create and write to a `data/` directory next to `index.php` (it will be created automatically on first run).
 3. Open the page in your browser and start adding feeds.
 
-\`\`\`bash
+```bash
 # Quick local test
 php -S localhost:8000
-\`\`\`
+```
 
 Then visit `http://localhost:8000`.
 
