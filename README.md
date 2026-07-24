@@ -22,7 +22,7 @@ A self-hosted, single-file RSS/Atom reader. No database, no build step, no depen
 ## Requirements
 
 - PHP 7.4 or newer
-- `ext-dom` and `ext-json` (required)
+- `ext-dom`, `ext-json`, and `ext-mbstring` (required — mbstring is used for accent-/case-insensitive search)
 - `ext-curl` (optional — falls back to `file_get_contents` if unavailable; parallel "refresh all" requires `curl_multi`, otherwise it falls back to sequential fetching)
 
 ## Installation
