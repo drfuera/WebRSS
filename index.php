@@ -2173,7 +2173,7 @@ a { color: var(--accent); }
     const overlay = document.createElement('div');
     overlay.id = 'image-overlay';
     overlay.innerHTML = `
-      <button class="image-overlay-close" id="image-overlay-close-btn" title="Stäng">✕</button>
+      <button class="image-overlay-close" id="image-overlay-close-btn" title="Close">✕</button>
       <img src="${esc(src)}" alt="${esc(alt)}">
     `;
     document.body.appendChild(overlay);
