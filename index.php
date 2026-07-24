@@ -24,6 +24,7 @@ define('MAX_ITEMS_PER_FEED', 300); // cap on how many articles we store per feed
 define('FETCH_TIMEOUT', 15);      // seconds
 define('REFRESH_THROTTLE_SECONDS', 60); // min time between real curl refreshes (shared across all clients)
 define('REFRESH_LOCK_FILE', DATA_DIR . '/last_refresh.txt');
+define('SYNCPLAY_FILE', DATA_DIR . '/syncplay.json');
 
 // ---------------------------------------------------------------------------
 // BASIC FILE HANDLING
@@ -92,6 +93,20 @@ function save_cache(string $feedId, array $data): void {
     write_json_file(cache_path($feedId), $data);
 }
 
+// Serializes read-modify-write cycles on one feed's cache file so concurrent
+// requests (mark_read, mark_all_read, refresh_feed) can't lose each other's updates.
+function with_cache_lock(string $feedId, callable $fn) {
+    if (!is_dir(CACHE_DIR)) mkdir(CACHE_DIR, 0775, true);
+    $lockPath = cache_path($feedId) . '.lock';
+    $fh = @fopen($lockPath, 'c+');
+    if ($fh === false) return $fn();
+    flock($fh, LOCK_EX);
+    $result = $fn();
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return $result;
+}
+
 // Atomic throttle: allows one real curl refresh (refresh_all) at most once
 // per REFRESH_THROTTLE_SECONDS, regardless of how many clients/tabs call it
 // simultaneously. Returns true and stamps the file with "now" if a fetch IS allowed,
@@ -151,6 +166,8 @@ function http_get(string $url): string {
             CURLOPT_CONNECTTIMEOUT => FETCH_TIMEOUT,
             CURLOPT_USERAGENT => $ua,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_HTTPHEADER => ['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'],
         ]);
         $body = curl_exec($ch);
@@ -215,6 +232,8 @@ function http_get_multi(array $urls): array {
             CURLOPT_CONNECTTIMEOUT => FETCH_TIMEOUT,
             CURLOPT_USERAGENT => $ua,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_HTTPHEADER => ['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'],
         ]);
         curl_multi_add_handle($mh, $ch);
@@ -273,7 +292,12 @@ function discover_feed_url(string $html, string $baseUrl): ?string {
                 continue;
             }
             if (preg_match('/href=["\']([^"\']+)["\']/i', $tag, $hrefMatch)) {
-                return resolve_url($baseUrl, html_entity_decode($hrefMatch[1]));
+                $resolved = resolve_url($baseUrl, html_entity_decode($hrefMatch[1]));
+                $scheme = parse_url($resolved, PHP_URL_SCHEME);
+                if ($scheme !== null && !in_array(strtolower($scheme), ['http', 'https'], true)) {
+                    continue;
+                }
+                return $resolved;
             }
         }
     }
@@ -296,12 +320,30 @@ function xp_html(DOMXPath $xp, DOMNode $ctx, array $queries): string {
         if ($nodes === false || $nodes->length === 0) continue;
         $node = $nodes->item(0);
         if ($node->hasChildNodes()) {
-            $html = '';
+            $hasElementChild = false;
             foreach ($node->childNodes as $child) {
-                if ($child->nodeType === XML_CDATA_SECTION_NODE) {
-                    $html .= $child->nodeValue;
-                } else {
+                if ($child->nodeType === XML_ELEMENT_NODE) { $hasElementChild = true; break; }
+            }
+            $html = '';
+            if ($hasElementChild) {
+                // Real nested XML markup (e.g. Atom xhtml content) — serialize the actual node tree.
+                foreach ($node->childNodes as $child) {
                     $html .= $node->ownerDocument->saveHTML($child);
+                }
+            } else {
+                // Plain text or CDATA — feeds commonly store an HTML string here,
+                // either CDATA-wrapped or entity-escaped. Either way the decoded
+                // nodeValue IS the HTML source; saveHTML() would double-escape it.
+                foreach ($node->childNodes as $child) {
+                    $html .= $child->nodeValue;
+                }
+                // Some feed generators escape their HTML markup TWICE (once as
+                // literal &lt;/&gt; inside the description text, then that text
+                // gets XML-escaped again). After normal XML decoding above, what's
+                // left still looks like "&lt;div...&gt;" — real tag chars, no "<".
+                // Decode once more so it becomes actual markup instead of visible text.
+                if (strpos($html, '<') === false && strpos($html, '&lt;') !== false) {
+                    $html = html_entity_decode($html, ENT_QUOTES, 'UTF-8');
                 }
             }
             $html = trim($html);
@@ -377,6 +419,7 @@ function parse_feed_xml(string $xmlStr): array {
             $guid = xp_text($xp, 'atom:id', $entry) ?: xp_text($xp, 'id', $entry) ?: ($link ?: $title);
 
             if (stripos($title, '#short') !== false) continue;
+            if (stripos($link, '/shorts') !== false) continue;
 
             $items[] = compact('guid', 'title', 'link', 'date', 'content');
         }
@@ -400,18 +443,118 @@ function parse_feed_xml(string $xmlStr): array {
     return ['title' => trim($feedTitle), 'items' => $items];
 }
 
-// Simple but effective sanitization of article HTML before display.
+// DOM-based allowlist sanitization of article HTML before display.
 function sanitize_html(string $html): string {
-    if (trim($html) === '') return '';
-    $html = preg_replace('/<script\b[^>]*>.*?<\/script>/is', '', $html);
-    $html = preg_replace('/<style\b[^>]*>.*?<\/style>/is', '', $html);
-    $html = preg_replace('/<(iframe|object|embed|form|input|button)\b[^>]*>.*?<\/\1>/is', '', $html);
-    $html = preg_replace('/<(iframe|object|embed|form|input|button|link|meta)\b[^>]*\/?>/is', '', $html);
-    $html = preg_replace('/\son\w+\s*=\s*"[^"]*"/i', '', $html);
-    $html = preg_replace("/\son\w+\s*=\s*'[^']*'/i", '', $html);
-    $html = preg_replace('/(href|src)\s*=\s*"\s*javascript:[^"]*"/i', '$1="#"', $html);
-    $html = preg_replace('/(href|src)\s*=\s*\'\s*javascript:[^\']*\'/i', '$1="#"', $html);
-    return trim($html);
+    $html = trim($html);
+    if ($html === '') return '';
+
+    $allowedTags = [
+        'p' => [], 'br' => [], 'hr' => [],
+        'b' => [], 'strong' => [], 'i' => [], 'em' => [], 'u' => [], 's' => [], 'strike' => [],
+        'blockquote' => [], 'pre' => [], 'code' => [],
+        'h1' => [], 'h2' => [], 'h3' => [], 'h4' => [], 'h5' => [], 'h6' => [],
+        'ul' => [], 'ol' => [], 'li' => [],
+        'span' => [], 'div' => [], 'sub' => [], 'sup' => [], 'small' => [],
+        'table' => [], 'thead' => [], 'tbody' => [], 'tr' => [],
+        'td' => ['colspan', 'rowspan'], 'th' => ['colspan', 'rowspan'],
+        'a' => ['href', 'title'],
+        'img' => ['src', 'alt', 'title', 'width', 'height'],
+        'figure' => [], 'figcaption' => [],
+        'video' => ['controls', 'poster', 'width', 'height'],
+        'audio' => ['controls'],
+        'source' => ['src', 'type'],
+    ];
+
+    $prev = libxml_use_internal_errors(true);
+    $dom = new DOMDocument();
+    $wrapped = '<?xml encoding="UTF-8"?><div id="__root__">' . $html . '</div>';
+    $ok = $dom->loadHTML($wrapped, LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_NONET | LIBXML_COMPACT);
+    libxml_clear_errors();
+    libxml_use_internal_errors($prev);
+    if (!$ok) return '';
+
+    $root = $dom->getElementsByTagName('div')->item(0);
+    if (!$root || $root->getAttribute('id') !== '__root__') return '';
+
+    sanitize_node_tree($root, $allowedTags);
+
+    $out = '';
+    foreach ($root->childNodes as $child) {
+        $out .= $dom->saveHTML($child);
+    }
+    return trim($out);
+}
+
+function is_safe_url(string $url, array $allowedSchemes): bool {
+    $url = trim($url);
+    if ($url === '') return false;
+    // Browsers strip ASCII control chars before parsing scheme; without this a value
+    // like "java\tscript:" shows no scheme here but still executes in the browser.
+    $stripped = preg_replace('/[\x00-\x1F\x7F]/', '', $url);
+    if ($stripped === '') return false;
+    if ($stripped[0] === '#' || $stripped[0] === '/') return true;
+    $scheme = parse_url($stripped, PHP_URL_SCHEME);
+    if ($scheme === null) return true;
+    return in_array(strtolower($scheme), $allowedSchemes, true);
+}
+
+function sanitize_node_tree(DOMNode $node, array $allowedTags): void {
+    $child = $node->firstChild;
+    while ($child !== null) {
+        $next = $child->nextSibling;
+
+        if ($child->nodeType === XML_COMMENT_NODE) {
+            $node->removeChild($child);
+            $child = $next;
+            continue;
+        }
+
+        if ($child->nodeType === XML_ELEMENT_NODE) {
+            /** @var DOMElement $child */
+            $tag = strtolower($child->nodeName);
+
+            if ($tag === 'script' || $tag === 'style') {
+                $node->removeChild($child);
+                $child = $next;
+                continue;
+            }
+
+            if (!isset($allowedTags[$tag])) {
+                sanitize_node_tree($child, $allowedTags);
+                while ($child->firstChild) {
+                    $node->insertBefore($child->firstChild, $child);
+                }
+                $node->removeChild($child);
+                $child = $next;
+                continue;
+            }
+
+            if ($child->hasAttributes()) {
+                $toRemove = [];
+                foreach ($child->attributes as $attr) {
+                    $aname = strtolower($attr->name);
+                    if (stripos($aname, 'on') === 0) { $toRemove[] = $attr->name; continue; }
+                    if (!in_array($aname, $allowedTags[$tag], true)) { $toRemove[] = $attr->name; continue; }
+                    if ($aname === 'href' && !is_safe_url($attr->value, ['http', 'https', 'mailto'])) {
+                        $toRemove[] = $attr->name;
+                    }
+                    if ($aname === 'src' && !is_safe_url($attr->value, ['http', 'https'])) {
+                        $toRemove[] = $attr->name;
+                    }
+                }
+                foreach ($toRemove as $aname) $child->removeAttribute($aname);
+            }
+
+            if ($tag === 'a') {
+                $child->setAttribute('target', '_blank');
+                $child->setAttribute('rel', 'noopener noreferrer');
+            }
+
+            sanitize_node_tree($child, $allowedTags);
+        }
+
+        $child = $next;
+    }
 }
 
 function normalize_timestamp(string $date): int {
@@ -450,36 +593,47 @@ function refresh_feed(array &$feedMeta, ?string $prefetchedBody = null, ?string 
         return $cached['items'] ?? [];
     }
 
-    $existing = load_cache($feedMeta['id']);
-    $existingByGuid = [];
-    if ($existing && isset($existing['items'])) {
-        foreach ($existing['items'] as $it) {
-            $existingByGuid[$it['guid']] = $it;
+    $newItems = with_cache_lock($feedMeta['id'], function () use ($feedMeta, $parsed) {
+        $existing = load_cache($feedMeta['id']);
+        $existingByGuid = [];
+        if ($existing && isset($existing['items'])) {
+            foreach ($existing['items'] as $it) {
+                $existingByGuid[$it['guid']] = $it;
+            }
         }
-    }
 
-    $newItems = [];
-    foreach ($parsed['items'] as $it) {
-        $ts = normalize_timestamp($it['date']);
-        $prev = $existingByGuid[$it['guid']] ?? null;
-        $newItems[] = [
-            'id' => substr(md5($it['guid']), 0, 16),
-            'guid' => $it['guid'],
-            'title' => $it['title'] !== '' ? $it['title'] : '(No title)',
-            'link' => $it['link'],
-            'date' => $it['date'],
-            'timestamp' => $ts,
-            'content' => sanitize_html($it['content']),
-            'read' => $prev['read'] ?? false,
-        ];
-    }
+        $items = [];
+        $seenGuids = [];
+        foreach ($parsed['items'] as $it) {
+            $ts = normalize_timestamp($it['date']);
+            $prev = $existingByGuid[$it['guid']] ?? null;
+            $items[] = [
+                'id' => substr(md5($it['guid']), 0, 16),
+                'guid' => $it['guid'],
+                'title' => $it['title'] !== '' ? $it['title'] : '(No title)',
+                'link' => is_safe_url($it['link'], ['http', 'https']) ? $it['link'] : '',
+                'date' => $it['date'],
+                'timestamp' => $ts,
+                'content' => sanitize_html($it['content']),
+                'read' => $prev['read'] ?? false,
+            ];
+            $seenGuids[$it['guid']] = true;
+        }
 
-    usort($newItems, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
-    if (count($newItems) > MAX_ITEMS_PER_FEED) {
-        $newItems = array_slice($newItems, 0, MAX_ITEMS_PER_FEED);
-    }
+        foreach ($existingByGuid as $guid => $prev) {
+            if (!isset($seenGuids[$guid])) {
+                $items[] = $prev;
+            }
+        }
 
-    save_cache($feedMeta['id'], ['items' => $newItems, 'fetched_at' => time()]);
+        usort($items, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
+        if (count($items) > MAX_ITEMS_PER_FEED) {
+            $items = array_slice($items, 0, MAX_ITEMS_PER_FEED);
+        }
+
+        save_cache($feedMeta['id'], ['items' => $items, 'fetched_at' => time()]);
+        return $items;
+    });
 
     $feedMeta['last_fetched'] = time();
     $feedMeta['error'] = null;
@@ -534,6 +688,53 @@ function find_folder(array &$db, string $id): ?int {
 
 if (isset($_GET['api'])) {
     $action = $_GET['api'];
+    ensure_data_dir();
+
+    // Syncplay har eget litet låsfilssystem — får aldrig vänta på feeds-låset,
+    // eftersom det pollas ~var 1.5s av varje ansluten klient.
+    if ($action === 'syncplay_get' || $action === 'syncplay_set') {
+        $syncLockFh = @fopen(SYNCPLAY_FILE . '.lock', 'c+');
+        if ($syncLockFh !== false) flock($syncLockFh, LOCK_EX);
+
+        if ($action === 'syncplay_get') {
+            $syncOut = read_json_file(SYNCPLAY_FILE, [
+                'active' => false, 'video_id' => null, 'playing' => false,
+                'position' => 0, 'server_time' => microtime(true), 'client_id' => null, 'rev' => 0,
+            ]);
+            $syncOut['now'] = microtime(true); // serverns klocka just NU, för klientens offset-uträkning
+            json_out($syncOut);
+        }
+
+        $videoId = (string)($_POST['video_id'] ?? '');
+        $active = ($_POST['active'] ?? '1') === '1';
+        $playing = ($_POST['playing'] ?? '1') === '1';
+        $position = (float)($_POST['position'] ?? 0);
+        $clientId = (string)($_POST['client_id'] ?? '');
+        $isHeartbeat = ($_POST['heartbeat'] ?? '0') === '1';
+        if ($active && $videoId === '') bad_request('video_id required.');
+        $syncData = read_json_file(SYNCPLAY_FILE, ['rev' => 0]);
+
+        // Hjärtslag är ingen användarhandling. Kommer det efter att någon
+        // annan klient tagit över (paus/seek/stäng från annan enhet) ska
+        // det ignoreras — annars skriver den gamla "källan" sin gamla
+        // status ovanpå den nya.
+        if ($isHeartbeat && $clientId !== ($syncData['client_id'] ?? null)) {
+            json_out(['ok' => true, 'rev' => $syncData['rev'] ?? 0]);
+        }
+
+        $syncData['active'] = $active;
+        if ($active) $syncData['video_id'] = $videoId;
+        $syncData['playing'] = $playing;
+        $syncData['position'] = $position;
+        $syncData['server_time'] = microtime(true);
+        $syncData['client_id'] = $clientId;
+        $syncData['rev'] = ($syncData['rev'] ?? 0) + 1;
+        write_json_file(SYNCPLAY_FILE, $syncData);
+        json_out(['ok' => true, 'rev' => $syncData['rev']]);
+    }
+
+    $feedsLockFh = @fopen(FEEDS_FILE . '.lock', 'c+');
+    if ($feedsLockFh !== false) flock($feedsLockFh, LOCK_EX);
     $db = load_feeds_db();
 
     try {
@@ -738,13 +939,17 @@ if (isset($_GET['api'])) {
                 $feedId = (string)($_POST['feed_id'] ?? '');
                 $itemId = (string)($_POST['item_id'] ?? '');
                 $read = ($_POST['read'] ?? '1') === '1';
-                $cached = load_cache($feedId);
-                if ($cached === null) bad_request('No cache for the feed.');
-                foreach ($cached['items'] as &$it) {
-                    if ($it['id'] === $itemId) { $it['read'] = $read; break; }
-                }
-                unset($it);
-                save_cache($feedId, $cached);
+                $found = with_cache_lock($feedId, function () use ($feedId, $itemId, $read) {
+                    $cached = load_cache($feedId);
+                    if ($cached === null) return false;
+                    foreach ($cached['items'] as &$it) {
+                        if ($it['id'] === $itemId) { $it['read'] = $read; break; }
+                    }
+                    unset($it);
+                    save_cache($feedId, $cached);
+                    return true;
+                });
+                if (!$found) bad_request('No cache for the feed.');
                 json_out(['ok' => true]);
             }
 
@@ -752,13 +957,19 @@ if (isset($_GET['api'])) {
                 $scope = (string)($_POST['scope'] ?? 'feed'); // feed | folder | all
                 $targetId = (string)($_POST['id'] ?? '');
 
+                $markFeedRead = function (string $feedId) {
+                    with_cache_lock($feedId, function () use ($feedId) {
+                        $cached = load_cache($feedId);
+                        if ($cached !== null) {
+                            foreach ($cached['items'] as &$it) $it['read'] = true;
+                            unset($it);
+                            save_cache($feedId, $cached);
+                        }
+                    });
+                };
+
                 if ($scope === 'feed') {
-                    $cached = load_cache($targetId);
-                    if ($cached !== null) {
-                        foreach ($cached['items'] as &$it) $it['read'] = true;
-                        unset($it);
-                        save_cache($targetId, $cached);
-                    }
+                    $markFeedRead($targetId);
                 } else {
                     if ($scope === 'all') {
                         $matchFeeds = $db['feeds'];
@@ -768,12 +979,7 @@ if (isset($_GET['api'])) {
                         $matchFeeds = array_filter($db['feeds'], fn($f) => $f['folder_id'] === $targetId);
                     }
                     foreach ($matchFeeds as $f) {
-                        $cached = load_cache($f['id']);
-                        if ($cached !== null) {
-                            foreach ($cached['items'] as &$it) $it['read'] = true;
-                            unset($it);
-                            save_cache($f['id'], $cached);
-                        }
+                        $markFeedRead($f['id']);
                     }
                 }
                 json_out(['ok' => true]);
@@ -805,6 +1011,27 @@ if (isset($_GET['api'])) {
                 unset($feedMeta);
                 save_feeds_db($db);
                 json_out(['ok' => true, 'throttled' => false, 'results' => $results]);
+            }
+
+            case 'search': {
+                $q = trim((string)($_GET['q'] ?? ''));
+                if ($q === '') json_out(['ok' => true, 'items' => []]);
+                $qLower = mb_strtolower($q);
+                $allItems = [];
+                foreach ($db['feeds'] as $feedMeta) {
+                    $cached = load_cache($feedMeta['id']);
+                    if (!$cached || empty($cached['items'])) continue;
+                    foreach ($cached['items'] as $it) {
+                        $haystack = mb_strtolower($it['title'] . ' ' . strip_tags($it['content']));
+                        if (mb_strpos($haystack, $qLower) !== false) {
+                            $it['feed_id'] = $feedMeta['id'];
+                            $it['feed_title'] = $feedMeta['title'];
+                            $allItems[] = $it;
+                        }
+                    }
+                }
+                usort($allItems, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
+                json_out(['ok' => true, 'items' => $allItems]);
             }
 
             default:
@@ -935,6 +1162,22 @@ a { color: var(--accent); }
   border-bottom: 1px solid var(--border);
 }
 .sidebar-actions { display: flex; gap: 8px; }
+.search-box {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 9px;
+}
+.search-box svg { flex-shrink: 0; color: var(--text-faint); }
+.search-box input {
+  border: none; background: transparent; color: var(--text);
+  width: 100%; outline: none; font-size: 12.5px;
+}
+.search-box input::placeholder { color: var(--text-faint); }
 .btn {
   border: 1px solid var(--border);
   background: var(--bg-elevated);
@@ -1130,6 +1373,7 @@ a { color: var(--accent); }
   color: #d7dae1;
 }
 .article-body img, .article-body video { max-width: 100%; height: auto; border-radius: 6px; }
+.article-body img { cursor: zoom-in; }
 .article-body a { color: var(--accent); }
 .article-body pre { background: var(--bg-elevated); padding: 12px; border-radius: 6px; overflow-x: auto; font-family: var(--mono); font-size: 13px; }
 .article-body blockquote { border-left: 3px solid var(--border); margin: 0; padding-left: 16px; color: var(--text-dim); }
@@ -1200,6 +1444,47 @@ a { color: var(--accent); }
   }
   #sidebar-backdrop.open { display: block; }
 }
+
+#syncplay-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(10, 11, 15, 0.88);
+  display: flex; align-items: center; justify-content: center;
+  padding: 4vh 4vw;
+}
+#syncplay-overlay .syncplay-box {
+  width: 100%; max-width: 1100px; aspect-ratio: 16 / 9;
+  position: relative; box-shadow: 0 20px 60px rgba(0,0,0,.5); border-radius: var(--radius);
+  overflow: hidden; background: #000;
+}
+#syncplay-overlay .syncplay-box iframe { width: 100%; height: 100%; border: 0; }
+#syncplay-overlay .syncplay-close {
+  position: absolute; top: 10px; right: 10px; z-index: 5;
+  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 22, 28, 0.85); color: var(--text); border: 1px solid var(--border);
+  border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1;
+}
+#syncplay-overlay .syncplay-close:hover { background: var(--bg-hover); }
+
+#image-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(10, 11, 15, 0.9);
+  display: flex; align-items: center; justify-content: center;
+  padding: 4vh 4vw;
+  cursor: zoom-out;
+}
+#image-overlay img {
+  max-width: 100%; max-height: 100%;
+  border-radius: 4px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  cursor: default;
+}
+#image-overlay .image-overlay-close {
+  position: absolute; top: 16px; right: 16px; z-index: 5;
+  width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 22, 28, 0.85); color: var(--text); border: 1px solid var(--border);
+  border-radius: 50%; cursor: pointer; font-size: 18px; line-height: 1;
+}
+#image-overlay .image-overlay-close:hover { background: var(--bg-hover); }
 </style>
 </head>
 <body>
@@ -1212,6 +1497,10 @@ a { color: var(--accent); }
         <button class="btn primary icon-only" id="btn-add-feed" title="Lägg till flöde"><svg width="14" height="14" viewBox="0 0 16 16"><circle cx="4" cy="12" r="1.6" fill="currentColor"/><path d="M2 6.5a7.5 7.5 0 017.5 7.5M2 2a12 12 0 0112 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12 2v4M10 4h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
         <button class="btn icon-only" id="btn-add-folder" title="Lägg till mapp"><svg width="14" height="14" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.5 2h7.5v7a1 1 0 01-1 1h-11a1 1 0 01-1-1v-8a1 1 0 011-1z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.5v4M6 9.5h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
         <button class="btn ghost icon-only" id="btn-refresh-all" title="Uppdatera alla flöden"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="15.33 2.67 15.33 6.67 11.33 6.67"/><polyline points="0.67 13.33 0.67 9.33 4.67 9.33"/><path d="M2.34 6a6 6 0 0 1 9.9-2.24L15.33 6.67M0.67 9.33L3.09 12.24A6 6 0 0 0 13.66 10"/></svg></button>
+      </div>
+      <div class="search-box">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="5"/><path d="M11 11l3.5 3.5" stroke-linecap="round"/></svg>
+        <input type="text" id="search-input" placeholder="Search articles…">
       </div>
     </div>
     <div id="tree-scroll"></div>
@@ -1260,6 +1549,7 @@ a { color: var(--accent); }
   const el = (sel) => document.querySelector(sel);
   const treeScroll = el('#tree-scroll');
   const articleList = el('#article-list');
+  const searchInput = el('#search-input');
   const listTitle = el('#list-title');
   const listCount = el('#list-count');
   const contentScroll = el('#article-content-scroll');
@@ -1352,6 +1642,21 @@ a { color: var(--accent); }
     }
   }
 
+  const faviconLink = document.querySelector('link[rel="icon"]');
+  const faviconBaseHref = faviconLink ? faviconLink.getAttribute('href') : '';
+
+  function updateFaviconBadge(count) {
+    if (!faviconLink) return;
+    if (!count || count <= 0) {
+      faviconLink.setAttribute('href', faviconBaseHref);
+      return;
+    }
+    const label = count > 99 ? '99+' : String(count);
+    const fontSize = label.length > 2 ? 5.2 : 7;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#e3a857"/><circle cx="4.3" cy="11.7" r="1.6" fill="#14161c"/><path d="M3 6.2a6.8 6.8 0 016.8 6.8" fill="none" stroke="#14161c" stroke-width="1.8" stroke-linecap="round"/><path d="M3 2.3a10.7 10.7 0 0110.7 10.7" fill="none" stroke="#14161c" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="8" r="5.5" fill="#4caf50" stroke="#14161c" stroke-width="0.8"/><text x="8" y="8.2" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="700" fill="#14161c">${label}</text></svg>`;
+    faviconLink.setAttribute('href', 'data:image/svg+xml,' + encodeURIComponent(svg));
+  }
+
   function updateUnreadBadges() {
     setBadge(treeScroll.querySelector('.special-row[data-id="all"]'), totalUnread());
     for (const folder of state.folders) {
@@ -1375,6 +1680,7 @@ a { color: var(--accent); }
       updateUnreadBadges();
       applyActiveSelection();
     }
+    updateFaviconBadge(totalUnread());
   }
 
   async function loadTree() {
@@ -1589,7 +1895,34 @@ a { color: var(--accent); }
 
   // ---------------- Selection & article list ----------------
 
+  let searchDebounceTimer = null;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchDebounceTimer);
+    const q = searchInput.value.trim();
+    if (q === '') {
+      if (state.selection?.type === 'search') selectAll();
+      return;
+    }
+    searchDebounceTimer = setTimeout(() => selectSearch(q), 300);
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      searchInput.value = '';
+      searchInput.blur();
+      if (state.selection?.type === 'search') selectAll();
+    }
+  });
+
+  async function selectSearch(query, opts = {}) {
+    state.selection = { type: 'search', query };
+    applyActiveSelection();
+    listTitle.innerHTML = `Search: "${esc(query)}"`;
+    btnMarkAllRead.style.display = 'none';
+    await loadItems(() => api('search', { params: { q: query } }), opts);
+  }
+
   async function selectAll(opts = {}) {
+    searchInput.value = '';
     state.selection = { type: 'all', id: 'all' };
     applyActiveSelection();
     listTitle.innerHTML = 'All articles';
@@ -1599,6 +1932,7 @@ a { color: var(--accent); }
   }
 
   async function selectFolder(id, name, opts = {}) {
+    searchInput.value = '';
     state.selection = { type: 'folder', id };
     applyActiveSelection();
     listTitle.innerHTML = esc(name);
@@ -1608,6 +1942,7 @@ a { color: var(--accent); }
   }
 
   async function selectFeed(id, opts = {}) {
+    searchInput.value = '';
     state.selection = { type: 'feed', id };
     applyActiveSelection();
     const feed = state.feeds.find(f => f.id === id);
@@ -1796,7 +2131,17 @@ a { color: var(--accent); }
     });
   });
 
+  function extractYoutubeId(item) {
+    const link = item.link || '';
+    let m = link.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/);
+    if (m) return m[1];
+    const content = item.content || '';
+    m = content.match(/youtube(?:-nocookie)?\.com\/embed\/([a-zA-Z0-9_-]{11})/);
+    return m ? m[1] : null;
+  }
+
   function showArticle(item, feedId) {
+    const ytId = extractYoutubeId(item);
     contentScroll.innerHTML = `
       <div id="article-content-inner">
         <div class="article-header">
@@ -1807,11 +2152,43 @@ a { color: var(--accent); }
             <span>${fmtDateLong(item.timestamp)}</span>
             <span>·</span>
             <a href="${esc(item.link)}" target="_blank" rel="noopener noreferrer">Open original ↗</a>
+            ${ytId ? `<span>·</span><button class="btn small ghost" id="btn-syncplay" data-yt="${ytId}">▶ Syncplay</button>` : ''}
           </div>
         </div>
         <div class="article-body">${item.content || '<p style="color:var(--text-faint)">No content could be fetched for this article.</p>'}</div>
       </div>
     `;
+    const syncBtn = document.getElementById('btn-syncplay');
+    if (syncBtn) syncBtn.addEventListener('click', () => startSyncplay(syncBtn.dataset.yt));
+  }
+
+  contentScroll.addEventListener('click', (e) => {
+    const img = e.target.closest('.article-body img');
+    if (!img) return;
+    openImageOverlay(img.src, img.alt || '');
+  });
+
+  function openImageOverlay(src, alt) {
+    if (document.getElementById('image-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'image-overlay';
+    overlay.innerHTML = `
+      <button class="image-overlay-close" id="image-overlay-close-btn" title="Stäng">✕</button>
+      <img src="${esc(src)}" alt="${esc(alt)}">
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeImageOverlay(); });
+    document.getElementById('image-overlay-close-btn').addEventListener('click', closeImageOverlay);
+    const escHandler = (e) => { if (e.key === 'Escape') closeImageOverlay(); };
+    overlay._escHandler = escHandler;
+    document.addEventListener('keydown', escHandler);
+  }
+
+  function closeImageOverlay() {
+    const overlay = document.getElementById('image-overlay');
+    if (!overlay) return;
+    if (overlay._escHandler) document.removeEventListener('keydown', overlay._escHandler);
+    overlay.remove();
   }
 
   async function markAllRead(scope, id) {
@@ -1831,6 +2208,12 @@ a { color: var(--accent); }
     backdrop.innerHTML = `<div class="modal">${html}</div>`;
     document.body.appendChild(backdrop);
     backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) backdrop.remove(); });
+    const escHandler = (e) => {
+      if (e.key === 'Escape') { backdrop.remove(); document.removeEventListener('keydown', escHandler); }
+    };
+    document.addEventListener('keydown', escHandler);
+    const autoInput = backdrop.querySelector('input[autofocus]');
+    if (autoInput) setTimeout(() => autoInput.select(), 0);
     return backdrop;
   }
 
@@ -1918,6 +2301,7 @@ a { color: var(--accent); }
       const f = state.folders.find(x => x.id === state.selection.id);
       selectFolder(state.selection.id, f ? f.name : '', { silent: true });
     } else if (state.selection.type === 'feed') selectFeed(state.selection.id, { silent: true });
+    else if (state.selection.type === 'search') selectSearch(state.selection.query, { silent: true });
   }
 
   async function renameFolder(id) {
@@ -2038,6 +2422,270 @@ a { color: var(--accent); }
   }).catch(err => {
     treeScroll.innerHTML = `<div class="empty-sidebar">Could not load: ${esc(err.message)}</div>`;
   });
+
+  // ---------------- Syncplay (YouTube, synced across connected clients) ----------------
+
+  const syncplayClientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  let syncplayRev = -1;
+  let syncplayPlayer = null;
+  let syncplayReady = false;
+  let syncplaySuppressUntil = 0; // ignorera lokala onStateChange-eko från våra egna seeks tills denna tidpunkt
+  let syncplayCorrectionTargetState = null; // vilket state EKOT av vår senaste rättning förväntas landa i — skiljer äkta eko från en ny, äkta åtgärd i samma fönster
+  let syncplayLocalActionUntil = 0; // vi agerade precis själva (play/paus/seek/stäng) — hindra en redan pågående poll med gammal data från att slåss mot vår färska ändring
+  let syncplayYtApiPromise = null;
+  let syncplayClockOffset = null; // uppskattad (server_time - klienttid), sekunder
+  let syncplayPendingState = null; // senaste fjärr-state innan spelaren var redo
+  let syncplayCurrentVideoId = null; // vilket videoId som är öppet just nu — används av heartbeat
+  let syncplayLastServerClientId = null; // client_id från senaste poll — vem som är "källa" just nu
+  let syncplayEstimatedOneWayLatencyMs = 50; // rullande skattning, halva RTT
+  let syncplayNudging = false; // hysteres: undviker att farten studsar runt tröskeln
+  let syncplayManualOffsetMs = parseInt(localStorage.getItem('rss_syncplay_offset_ms') || '0', 10) || 0; // fast kalibrering — kompenserar skärmens egen avkodnings-/panellatens, inte nätverksdrift
+
+  function loadYoutubeApi() {
+    if (syncplayYtApiPromise) return syncplayYtApiPromise;
+    syncplayYtApiPromise = new Promise((resolve) => {
+      if (window.YT && window.YT.Player) { resolve(); return; }
+      const prevCb = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = () => { if (prevCb) prevCb(); resolve(); };
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+    });
+    return syncplayYtApiPromise;
+  }
+
+  function syncplayExpectedPosition(data) {
+    const clientNow = Date.now() / 1000;
+    const serverNow = syncplayClockOffset === null ? data.now : clientNow + syncplayClockOffset;
+    const elapsed = data.playing ? Math.max(0, serverNow - data.server_time) : 0;
+    // Manuell offset kompenserar FAST latens i just DEN HÄR skärmens
+    // avkodnings-/panelkedja (t.ex. TV-processing) — sånt koden aldrig kan
+    // mäta, för det händer efter att bilden lämnat webbläsaren.
+    return data.position + elapsed + (syncplayManualOffsetMs / 1000);
+  }
+
+  function syncplayFormatOffset(ms) {
+    if (ms === 0) return '0 ms';
+    return (ms > 0 ? '+' : '') + ms + ' ms';
+  }
+
+  function syncplayAdjustOffset(deltaMs) {
+    syncplayManualOffsetMs = Math.max(-1000, Math.min(1000, syncplayManualOffsetMs + deltaMs));
+    localStorage.setItem('rss_syncplay_offset_ms', String(syncplayManualOffsetMs));
+    const label = document.getElementById('syncplay-offset-label');
+    if (label) label.textContent = syncplayFormatOffset(syncplayManualOffsetMs);
+  }
+
+  let syncplayLastSeekAt = 0;
+
+  // Körs på VARJE poll (inte bara vid ny rev) så drift korrigeras löpande
+  // under uppspelning, inte bara direkt efter någons play/paus/spola.
+  // Seek-cooldown förhindrar att vi hackar sönder uppspelningen genom
+  // att ständigt seeka mot en keyframe som i sig ligger en bit fel.
+
+  const SYNCPLAY_SEEK_DRIFT = 2;      // sekunder — över denna gräns: hård seek
+  const SYNCPLAY_NUDGE_START = 0.08;  // sekunder — börja knuffa farten över denna gräns
+  const SYNCPLAY_NUDGE_STOP = 0.03;   // sekunder — sluta knuffa under denna gräns (hysteres mot studs)
+
+  // YouTube-spelaren accepterar bara vissa uppspelningshastigheter (oftast
+  // 0.75/1/1.25 osv). Kan inte be om t.ex. 1.05x — tar närmaste tillgängliga
+  // rate över/under 1x istället.
+  function syncplayPickNudgeRate(speedUp) {
+    let rates = [0.75, 1, 1.25];
+    try {
+      const avail = syncplayPlayer.getAvailablePlaybackRates();
+      if (avail && avail.length) rates = avail;
+    } catch (e) { /* fall tillbaka på standardlistan */ }
+    const candidates = speedUp ? rates.filter(r => r > 1) : rates.filter(r => r < 1);
+    if (!candidates.length) return 1;
+    return speedUp ? Math.min(...candidates) : Math.max(...candidates);
+  }
+
+  function syncplayApplyState(data) {
+    if (!syncplayPlayer || !syncplayReady) { syncplayPendingState = data; return; }
+    const pState = syncplayPlayer.getPlayerState();
+    if (pState === YT.PlayerState.BUFFERING) return; // slåss inte mot en pågående seek
+    const expected = syncplayExpectedPosition(data);
+    const current = syncplayPlayer.getCurrentTime();
+    const targetState = data.playing ? YT.PlayerState.PLAYING : YT.PlayerState.PAUSED;
+
+    // Alla klienter (även den som senast styrde videon) seekar mot samma
+    // beräknade tidsstämpel. Då snappar alla till SAMMA keyframe istället
+    // för att bara mottagaren kvantiseras medan källan förblir okvantiserad
+    // — vilket annars gör att de aldrig riktigt möts.
+    const drift = expected - current; // positiv = vi ligger efter, negativ = vi ligger före
+    const canSeek = Date.now() - syncplayLastSeekAt > 2500;
+    if (Math.abs(drift) > SYNCPLAY_SEEK_DRIFT && canSeek) {
+      // Stor drift: bara då är en hörbar seek värt det.
+      syncplayLastSeekAt = Date.now();
+      syncplaySuppressUntil = Date.now() + 2500; // seek + buffringstid
+      syncplayCorrectionTargetState = targetState; // vad EKOT förväntas bli — skiljer eko från en riktig ny åtgärd
+      syncplayPlayer.seekTo(expected, true);
+      syncplayPlayer.setPlaybackRate(1);
+      syncplayNudging = false;
+    } else {
+      // Hysteres: starta knuff över START, sluta först under STOP.
+      // Utan glapp studsar farten fram och tillbaka runt en enda tröskel.
+      if (Math.abs(drift) > SYNCPLAY_NUDGE_START) syncplayNudging = true;
+      else if (Math.abs(drift) < SYNCPLAY_NUDGE_STOP) syncplayNudging = false;
+
+      if (syncplayNudging) {
+        syncplayPlayer.setPlaybackRate(syncplayPickNudgeRate(drift > 0));
+      } else {
+        syncplayPlayer.setPlaybackRate(1);
+      }
+    }
+    if (data.playing && pState !== YT.PlayerState.PLAYING) {
+      syncplaySuppressUntil = Math.max(syncplaySuppressUntil, Date.now() + 1200);
+      syncplayCorrectionTargetState = targetState;
+      syncplayPlayer.playVideo();
+    }
+    if (!data.playing && pState !== YT.PlayerState.PAUSED) {
+      syncplaySuppressUntil = Math.max(syncplaySuppressUntil, Date.now() + 1200);
+      syncplayCorrectionTargetState = targetState;
+      syncplayPlayer.pauseVideo();
+    }
+  }
+
+  async function openSyncplayOverlay(videoId, startMuted = true) {
+    if (document.getElementById('syncplay-overlay')) return;
+    await loadYoutubeApi();
+    syncplayReady = false;
+    syncplayCurrentVideoId = videoId;
+    const overlay = document.createElement('div');
+    overlay.id = 'syncplay-overlay';
+    overlay.innerHTML = `
+      <div class="syncplay-box">
+        <button class="syncplay-close" id="syncplay-close-btn" title="Stäng för alla">✕</button>
+        <div id="syncplay-offset-ctrl" style="position:absolute;bottom:10px;right:10px;z-index:6;background:rgba(20,22,28,.75);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:4px 6px;font-size:11px;display:flex;align-items:center;gap:4px;">
+          <button id="syncplay-offset-minus" title="Justera bakåt" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">−</button>
+          <span id="syncplay-offset-label">${syncplayFormatOffset(syncplayManualOffsetMs)}</span>
+          <button id="syncplay-offset-plus" title="Justera framåt" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">+</button>
+        </div>
+        <div id="syncplay-player"></div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    document.getElementById('syncplay-close-btn').addEventListener('click', () => {
+      syncplayLocalActionUntil = Date.now() + 1200;
+      syncplaySet({ active: false, video_id: videoId, playing: false, position: 0 });
+      closeSyncplayOverlay();
+    });
+    document.getElementById('syncplay-offset-minus').addEventListener('click', () => syncplayAdjustOffset(-20));
+    document.getElementById('syncplay-offset-plus').addEventListener('click', () => syncplayAdjustOffset(20));
+    syncplayPlayer = new YT.Player('syncplay-player', {
+      videoId,
+      playerVars: { enablejsapi: 1, autoplay: 1, mute: startMuted ? 1 : 0, playsinline: 1 },
+      events: {
+        onReady: () => {
+          syncplayReady = true;
+          if (syncplayPendingState) { syncplayApplyState(syncplayPendingState); syncplayPendingState = null; }
+        },
+        onStateChange: (e) => {
+          // Svälj bara om det ser ut som EKOT av vår egen senaste rättning
+          // (samma state vi själva precis tvingade fram). En äkta åtgärd åt
+          // andra hållet ska alltid slippa igenom, även mitt i fönstret —
+          // annars kan bara källan någonsin styra videon.
+          if (Date.now() < syncplaySuppressUntil && e.data === syncplayCorrectionTargetState) return;
+          if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
+            syncplayLocalActionUntil = Date.now() + 1200;
+            syncplaySet({
+              active: true, video_id: videoId,
+              playing: e.data === YT.PlayerState.PLAYING,
+              position: syncplayPlayer.getCurrentTime(),
+            });
+          }
+        },
+      },
+    });
+  }
+
+  function closeSyncplayOverlay() {
+    const overlay = document.getElementById('syncplay-overlay');
+    if (overlay) overlay.remove();
+    syncplayPlayer = null;
+    syncplayReady = false;
+    syncplayPendingState = null;
+    syncplayCurrentVideoId = null;
+  }
+
+  async function syncplaySet(opts) {
+    // Position mäts lokalt FÖRE fetch, men servern stämplar server_time vid
+    // MOTTAGANDET. Utan kompensation ligger varje följare konsekvent en
+    // nätverkslatens FÖRE värdens riktiga tidpunkt.
+    const latencyCompensatedPosition = opts.playing
+      ? (opts.position || 0) + (syncplayEstimatedOneWayLatencyMs / 1000)
+      : (opts.position || 0);
+    try {
+      const res = await api('syncplay_set', { method: 'POST', body: {
+        active: opts.active ? '1' : '0',
+        video_id: opts.video_id || '',
+        playing: opts.playing ? '1' : '0',
+        position: String(latencyCompensatedPosition),
+        client_id: syncplayClientId,
+        heartbeat: opts.heartbeat ? '1' : '0',
+      }});
+      syncplayRev = res.rev;
+    } catch (e) { toast('Syncplay error: ' + e.message); }
+  }
+
+  function startSyncplay(videoId) {
+    syncplayLocalActionUntil = Date.now() + 1200;
+    syncplaySet({ active: true, video_id: videoId, playing: true, position: 0 });
+    // Riktig klick-gest just nu -> webbläsaren tillåter autoplay MED ljud.
+    openSyncplayOverlay(videoId, false);
+  }
+
+  async function pollSyncplay() {
+    const reqStart = Date.now();
+    let data;
+    try { data = await api('syncplay_get'); } catch (e) { return; }
+    const reqEnd = Date.now();
+
+    // Kompensera för tur-och-retur: anta server_time gäller vid request-MITTEN,
+    // inte vid svarets ankomst — annars byggs halva RTT in som permanent fel.
+    const midClientTime = (reqStart + reqEnd) / 2000;
+    const offsetSample = data.now - midClientTime;
+    syncplayClockOffset = syncplayClockOffset === null ? offsetSample : (syncplayClockOffset * 0.8 + offsetSample * 0.2);
+    syncplayEstimatedOneWayLatencyMs = syncplayEstimatedOneWayLatencyMs * 0.8 + ((reqEnd - reqStart) / 2) * 0.2;
+
+    syncplayRev = data.rev;
+    syncplayLastServerClientId = data.client_id;
+
+    // Vi agerade precis själva (play/paus/seek/stäng) — invänta att den
+    // egna skrivningen hinner landa innan vi reagerar på polldata.
+    if (Date.now() < syncplayLocalActionUntil) return;
+
+    if (!data.active) { closeSyncplayOverlay(); return; }
+    if (!document.getElementById('syncplay-overlay')) { await openSyncplayOverlay(data.video_id); }
+
+    // Källan (den som senast styrde videon) korrigerar aldrig sig själv —
+    // det var det som orsakade loopen. Bara mottagande klienter synkas mot den.
+    if (data.client_id === syncplayClientId) return;
+
+    syncplayApplyState(data);
+  }
+
+  setInterval(pollSyncplay, 250); // tätare poll = kortare fönster innan drift upptäcks
+
+  const SYNCPLAY_HEARTBEAT_MS = 500; // matchar tätare poll, håller server-state färsk
+
+  // Håller server-state färsk medan videon spelas, inte bara vid play/paus/seek.
+  // Utan denna extrapolerar följarna rakt fram tills nästa event — buffrar
+  // källan syns det inte förrän långt senare och drift byggs upp obemärkt.
+  function syncplayHeartbeat() {
+    if (!syncplayPlayer || !syncplayReady || !syncplayCurrentVideoId) return;
+    if (syncplayLastServerClientId !== syncplayClientId) return; // bara källan hjärtslår
+    if (syncplayPlayer.getPlayerState() !== YT.PlayerState.PLAYING) return;
+    syncplaySet({
+      active: true,
+      video_id: syncplayCurrentVideoId,
+      playing: true,
+      position: syncplayPlayer.getCurrentTime(),
+      heartbeat: true,
+    });
+  }
+  setInterval(syncplayHeartbeat, SYNCPLAY_HEARTBEAT_MS);
 
   // Auto-refresh all feeds in the background every 5 minutes.
   async function autoRefreshAll() {
