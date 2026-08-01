@@ -25,6 +25,7 @@ define('FETCH_TIMEOUT', 15);      // seconds
 define('REFRESH_THROTTLE_SECONDS', 60); // min time between real curl refreshes (shared across all clients)
 define('REFRESH_LOCK_FILE', DATA_DIR . '/last_refresh.txt');
 define('SYNCPLAY_FILE', DATA_DIR . '/syncplay.json');
+define('SYNCPLAY_PLAYLIST_FILE', DATA_DIR . '/syncplay_playlist.json');
 
 // ---------------------------------------------------------------------------
 // BASIC FILE HANDLING
@@ -690,8 +691,8 @@ if (isset($_GET['api'])) {
     $action = $_GET['api'];
     ensure_data_dir();
 
-    // Syncplay har eget litet låsfilssystem — får aldrig vänta på feeds-låset,
-    // eftersom det pollas ~var 1.5s av varje ansluten klient.
+    // Syncplay has its own small lock-file system — must never wait on the feeds lock,
+    // since it's polled ~every 1.5s by every connected client.
     if ($action === 'syncplay_get' || $action === 'syncplay_set') {
         $syncLockFh = @fopen(SYNCPLAY_FILE . '.lock', 'c+');
         if ($syncLockFh !== false) flock($syncLockFh, LOCK_EX);
@@ -701,7 +702,7 @@ if (isset($_GET['api'])) {
                 'active' => false, 'video_id' => null, 'playing' => false,
                 'position' => 0, 'server_time' => microtime(true), 'client_id' => null, 'rev' => 0,
             ]);
-            $syncOut['now'] = microtime(true); // serverns klocka just NU, för klientens offset-uträkning
+            $syncOut['now'] = microtime(true); // server's clock right NOW, for the client's offset calculation
             json_out($syncOut);
         }
 
@@ -714,10 +715,10 @@ if (isset($_GET['api'])) {
         if ($active && $videoId === '') bad_request('video_id required.');
         $syncData = read_json_file(SYNCPLAY_FILE, ['rev' => 0]);
 
-        // Hjärtslag är ingen användarhandling. Kommer det efter att någon
-        // annan klient tagit över (paus/seek/stäng från annan enhet) ska
-        // det ignoreras — annars skriver den gamla "källan" sin gamla
-        // status ovanpå den nya.
+        // A heartbeat is not a user action. If it arrives after another
+        // client has taken over (pause/seek/close from another device) it
+        // should be ignored — otherwise the old "source" overwrites the
+        // new status with its old one.
         if ($isHeartbeat && $clientId !== ($syncData['client_id'] ?? null)) {
             json_out(['ok' => true, 'rev' => $syncData['rev'] ?? 0]);
         }
@@ -733,6 +734,58 @@ if (isset($_GET['api'])) {
         json_out(['ok' => true, 'rev' => $syncData['rev']]);
     }
 
+    if (in_array($action, ['syncplay_playlist_get','syncplay_playlist_add','syncplay_playlist_delete','syncplay_playlist_advance'], true)) {
+        $plLockFh = @fopen(SYNCPLAY_PLAYLIST_FILE . '.lock', 'c+');
+        if ($plLockFh !== false) flock($plLockFh, LOCK_EX);
+        $playlist = read_json_file(SYNCPLAY_PLAYLIST_FILE, ['items' => []]);
+        if (!isset($playlist['items'])) $playlist['items'] = [];
+        switch ($action) {
+            case 'syncplay_playlist_get':
+                json_out($playlist);
+            case 'syncplay_playlist_add': {
+                $videoId = trim((string)($_POST['video_id'] ?? ''));
+                $title = trim((string)($_POST['title'] ?? ''));
+                if ($videoId === '' || !preg_match('/^[a-zA-Z0-9_-]{11}$/', $videoId)) bad_request('Invalid video id.');
+                if ($title === '') {
+                    try {
+                        $oembed = http_get('https://www.youtube.com/oembed?url=' . urlencode('https://www.youtube.com/watch?v=' . $videoId) . '&format=json');
+                        $meta = json_decode($oembed, true);
+                        if (is_array($meta) && !empty($meta['title'])) $title = (string)$meta['title'];
+                    } catch (Throwable $e) { /* falls back to the video id below */ }
+                }
+                $exists = false;
+                foreach ($playlist['items'] as $it) { if ($it['video_id'] === $videoId) { $exists = true; break; } }
+                if (!$exists) {
+                    $playlist['items'][] = [
+                        'id' => gen_id(),
+                        'video_id' => $videoId,
+                        'title' => $title !== '' ? $title : $videoId,
+                        'added_at' => time(),
+                    ];
+                    write_json_file(SYNCPLAY_PLAYLIST_FILE, $playlist);
+                }
+                json_out($playlist);
+            }
+            case 'syncplay_playlist_delete': {
+                $id = (string)($_POST['id'] ?? '');
+                $videoId = (string)($_POST['video_id'] ?? '');
+                $playlist['items'] = array_values(array_filter($playlist['items'], function ($it) use ($id, $videoId) {
+                    if ($id !== '' && $it['id'] === $id) return false;
+                    if ($videoId !== '' && $it['video_id'] === $videoId) return false;
+                    return true;
+                }));
+                write_json_file(SYNCPLAY_PLAYLIST_FILE, $playlist);
+                json_out($playlist);
+            }
+            case 'syncplay_playlist_advance': {
+                $videoId = (string)($_POST['video_id'] ?? '');
+                $playlist['items'] = array_values(array_filter($playlist['items'], fn($it) => $it['video_id'] !== $videoId));
+                write_json_file(SYNCPLAY_PLAYLIST_FILE, $playlist);
+                $next = $playlist['items'][0] ?? null;
+                json_out(['items' => $playlist['items'], 'next' => $next]);
+            }
+        }
+    }
     $feedsLockFh = @fopen(FEEDS_FILE . '.lock', 'c+');
     if ($feedsLockFh !== false) flock($feedsLockFh, LOCK_EX);
     $db = load_feeds_db();
@@ -1464,6 +1517,13 @@ a { color: var(--accent); }
   border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1;
 }
 #syncplay-overlay .syncplay-close:hover { background: var(--bg-hover); }
+#syncplay-overlay .syncplay-skip {
+  position: absolute; top: 10px; right: 50px; z-index: 5;
+  height: 32px; padding: 0 12px; display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 22, 28, 0.85); color: var(--text); border: 1px solid var(--border);
+  border-radius: 16px; cursor: pointer; font-size: 12.5px; font-weight: 500; gap: 4px;
+}
+#syncplay-overlay .syncplay-skip:hover { background: var(--bg-hover); }
 
 #image-overlay {
   position: fixed; inset: 0; z-index: 60;
@@ -1494,9 +1554,9 @@ a { color: var(--accent); }
   <div id="sidebar">
     <div class="sidebar-header">
       <div class="sidebar-actions">
-        <button class="btn primary icon-only" id="btn-add-feed" title="Lägg till flöde"><svg width="14" height="14" viewBox="0 0 16 16"><circle cx="4" cy="12" r="1.6" fill="currentColor"/><path d="M2 6.5a7.5 7.5 0 017.5 7.5M2 2a12 12 0 0112 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12 2v4M10 4h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
-        <button class="btn icon-only" id="btn-add-folder" title="Lägg till mapp"><svg width="14" height="14" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.5 2h7.5v7a1 1 0 01-1 1h-11a1 1 0 01-1-1v-8a1 1 0 011-1z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.5v4M6 9.5h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
-        <button class="btn ghost icon-only" id="btn-refresh-all" title="Uppdatera alla flöden"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="15.33 2.67 15.33 6.67 11.33 6.67"/><polyline points="0.67 13.33 0.67 9.33 4.67 9.33"/><path d="M2.34 6a6 6 0 0 1 9.9-2.24L15.33 6.67M0.67 9.33L3.09 12.24A6 6 0 0 0 13.66 10"/></svg></button>
+        <button class="btn primary icon-only" id="btn-add-feed" title="Add feed"><svg width="14" height="14" viewBox="0 0 16 16"><circle cx="4" cy="12" r="1.6" fill="currentColor"/><path d="M2 6.5a7.5 7.5 0 017.5 7.5M2 2a12 12 0 0112 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12 2v4M10 4h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+        <button class="btn icon-only" id="btn-add-folder" title="Add folder"><svg width="14" height="14" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.5 2h7.5v7a1 1 0 01-1 1h-11a1 1 0 01-1-1v-8a1 1 0 011-1z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.5v4M6 9.5h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
+        <button class="btn ghost icon-only" id="btn-refresh-all" title="Refresh all feeds"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><polyline points="15.33 2.67 15.33 6.67 11.33 6.67"/><polyline points="0.67 13.33 0.67 9.33 4.67 9.33"/><path d="M2.34 6a6 6 0 0 1 9.9-2.24L15.33 6.67M0.67 9.33L3.09 12.24A6 6 0 0 0 13.66 10"/></svg></button>
       </div>
       <div class="search-box">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="5"/><path d="M11 11l3.5 3.5" stroke-linecap="round"/></svg>
@@ -1511,7 +1571,7 @@ a { color: var(--accent); }
   <div id="main">
     <div id="article-list-pane">
       <div class="pane-toolbar">
-        <button class="btn ghost icon-only" id="btn-toggle-sidebar" title="Visa flöden"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg></button>
+        <button class="btn ghost icon-only" id="btn-toggle-sidebar" title="Show feeds"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg></button>
         <div class="pane-title" id="list-title">Select a folder or feed<span class="count" id="list-count"></span></div>
         <div class="toolbar-actions">
           <button class="btn small ghost" id="btn-mark-all-read" style="display:none;">Mark all as read</button>
@@ -1693,13 +1753,9 @@ a { color: var(--accent); }
   }
 
   function renderTree() {
-    const rootFeeds = state.feeds.filter(f => !f.folder_id);
-    let html = '';
-
-    html += specialRow('all', 'All articles', totalUnread(), iconLayers());
-
+    const rootFeeds = state.feeds.filter(f => !f.folder_id);    let html = '';
     for (const folder of state.folders) {
-      const children = state.feeds.filter(f => f.folder_id === folder.id);
+const children = state.feeds.filter(f => f.folder_id === folder.id);
       const unread = children.reduce((s, f) => s + (f.unread || 0), 0);
       const isOpen = !state.collapsed[folder.id];
       html += `<div class="folder-group">
@@ -1717,18 +1773,15 @@ a { color: var(--accent); }
           ${children.map(f => feedRow(f)).join('') || '<div class="empty-sidebar">No feeds here yet.</div>'}
         </div>
       </div>`;
-    }
-
-    html += rootFeeds.map(f => feedRow(f)).join('');
-
+    }    html += rootFeeds.map(f => feedRow(f)).join('');
     if (state.folders.length === 0 && state.feeds.length === 0) {
       html += `<div class="empty-sidebar">No feeds yet.<br>Click the <b>+</b> icon above to add your first RSS/Atom feed.</div>`;
     }
-
+    html += '<div id="syncplay-section"></div>';
     treeScroll.innerHTML = html;
+    renderSyncplaySection();
   }
-
-  function feedRow(f) {
+function feedRow(f) {
     const active = state.selection?.type === 'feed' && state.selection.id === f.id;
     let host = '';
     try { host = new URL(f.url).hostname; } catch (e) { host = ''; }
@@ -1758,6 +1811,88 @@ a { color: var(--accent); }
   function iconLayers() { return `<svg width="14" height="14" viewBox="0 0 16 16"><path d="M8 2l6.5 3.3L8 8.6 1.5 5.3 8 2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M1.5 8.7L8 12l6.5-3.3M1.5 11.7L8 15l6.5-3.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>`; }
   function iconEdit() { return `<svg width="14" height="14" viewBox="0 0 16 16"><path d="M11 2l3 3-8 8-3.5 1 1-3.5 8-8z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>`; }
   function iconTrash() { return `<svg width="14" height="14" viewBox="0 0 16 16"><path d="M3 4.5h10M6 4.5V3a1 1 0 011-1h2a1 1 0 011 1v1.5M4.5 4.5l.6 8.5a1 1 0 001 1h3.8a1 1 0 001-1l.6-8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`; }
+  function iconPlay() { return `<svg width="14" height="14" viewBox="0 0 16 16" style="position:relative;top:3px;"><path d="M4 2.5l9 5.5-9 5.5z" fill="currentColor"/></svg>`; }
+  function iconPlus() { return `<svg width="12" height="12" viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`; }
+  function syncplayItemRow(it) {
+    return `<div class="tree-feed" data-type="syncplay-item" data-id="${it.id}" data-video-id="${it.video_id}">
+      <span class="tree-icon">${iconFeed()}</span>
+      <span class="tree-label" title="${esc(it.title)}">${esc(it.title)}</span>
+      <span class="tree-item-actions">
+        <button class="icon-btn" data-action="delete-syncplay-item" data-id="${it.id}" title="Delete">${iconTrash()}</button>
+      </span>
+    </div>`;
+  }
+  function renderSyncplaySection() {
+    const container = document.getElementById('syncplay-section');
+    if (!container) return;
+    const items = state.syncplayPlaylist || [];
+    container.innerHTML = `<div class="folder-group">
+      <div class="tree-folder" data-type="syncplay-header">
+        <span class="tree-icon">${iconPlay()}</span>
+        <span class="tree-label">Syncplay</span>
+        ${items.length ? `<span class="unread-badge">${items.length}</span>` : ''}
+        <button class="btn ghost icon-only" data-action="add-syncplay-url" title="Add YouTube URL" style="margin-left:auto;width:22px;height:22px;">${iconPlus()}</button>
+      </div>
+      <div class="folder-children">
+        ${items.map(syncplayItemRow).join('') || '<div class="empty-sidebar">Playlist is empty.</div>'}
+      </div>
+    </div>`;
+  }
+  async function loadSyncplayPlaylist() {
+    try {
+      const data = await api('syncplay_playlist_get');
+      state.syncplayPlaylist = data.items || [];
+      renderSyncplaySection();
+    } catch (e) { /* silent */ }
+  }
+  async function addToSyncplayPlaylist(videoId, title) {
+    try {
+      await api('syncplay_playlist_add', { method: 'POST', body: { video_id: videoId, title } });
+      toast('Added to Syncplay playlist.');
+      await loadSyncplayPlaylist();
+    } catch (e) { toast('Could not add: ' + e.message); }
+  }
+  async function deleteSyncplayItem(id) {
+    try {
+      await api('syncplay_playlist_delete', { method: 'POST', body: { id } });
+      await loadSyncplayPlaylist();
+    } catch (e) { toast('Could not delete: ' + e.message); }
+  }
+  function extractYoutubeIdFromUrl(url) {
+    const m = (url || '').match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/);
+    return m ? m[1] : null;
+  }
+  function openAddSyncplayUrlModal() {
+    const backdrop = openModal(`
+      <h2>Add YouTube video</h2>
+      <div class="field"><label>YouTube URL</label><input type="text" id="m-yt-url" placeholder="https://www.youtube.com/watch?v=..." autofocus></div>
+      <div class="modal-error" id="m-error"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="m-cancel">Cancel</button>
+        <button class="btn primary" id="m-submit">Add</button>
+      </div>
+    `);
+    const submit = async () => {
+      const url = backdrop.querySelector('#m-yt-url').value.trim();
+      const errEl = backdrop.querySelector('#m-error');
+      const btn = backdrop.querySelector('#m-submit');
+      const videoId = extractYoutubeIdFromUrl(url);
+      if (!videoId) { errEl.textContent = 'Invalid YouTube URL.'; return; }
+      btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+      try {
+        await api('syncplay_playlist_add', { method: 'POST', body: { video_id: videoId } });
+        backdrop.remove();
+        await loadSyncplayPlaylist();
+        toast('Added to Syncplay playlist.');
+      } catch (e) {
+        errEl.textContent = e.message;
+        btn.disabled = false; btn.textContent = 'Add';
+      }
+    };
+    backdrop.querySelector('#m-submit').addEventListener('click', submit);
+    backdrop.querySelector('#m-cancel').addEventListener('click', () => backdrop.remove());
+    backdrop.querySelector('#m-yt-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  }
 
   treeScroll.addEventListener('click', async (e) => {
     const actionBtn = e.target.closest('[data-action]');
@@ -1769,11 +1904,14 @@ a { color: var(--accent); }
       if (action === 'delete-folder') return deleteFolder(id);
       if (action === 'rename-feed') return renameFeed(id);
       if (action === 'delete-feed') return deleteFeed(id);
+      if (action === 'delete-syncplay-item') return deleteSyncplayItem(id);
+      if (action === 'add-syncplay-url') return openAddSyncplayUrlModal();
       return;
     }
 
     const folderRow = e.target.closest('.tree-folder');
     if (folderRow) {
+      if (folderRow.dataset.type !== 'folder') return;
       const id = folderRow.dataset.id;
       const chevron = e.target.closest('.chevron');
       const childrenEl = treeScroll.querySelector(`[data-folder-children="${id}"]`);
@@ -1790,6 +1928,10 @@ a { color: var(--accent); }
 
     const feedRowEl = e.target.closest('.tree-feed');
     if (feedRowEl) {
+      if (feedRowEl.dataset.type === 'syncplay-item') {
+        startSyncplay(feedRowEl.dataset.videoId);
+        return;
+      }
       selectFeed(feedRowEl.dataset.id);
       return;
     }
@@ -1900,7 +2042,7 @@ a { color: var(--accent); }
     clearTimeout(searchDebounceTimer);
     const q = searchInput.value.trim();
     if (q === '') {
-      if (state.selection?.type === 'search') selectAll();
+      if (state.selection?.type === 'search') clearMainSelection();
       return;
     }
     searchDebounceTimer = setTimeout(() => selectSearch(q), 300);
@@ -1909,7 +2051,7 @@ a { color: var(--accent); }
     if (e.key === 'Escape') {
       searchInput.value = '';
       searchInput.blur();
-      if (state.selection?.type === 'search') selectAll();
+      if (state.selection?.type === 'search') clearMainSelection();
     }
   });
 
@@ -1921,14 +2063,16 @@ a { color: var(--accent); }
     await loadItems(() => api('search', { params: { q: query } }), opts);
   }
 
-  async function selectAll(opts = {}) {
+  function clearMainSelection() {
     searchInput.value = '';
-    state.selection = { type: 'all', id: 'all' };
+    state.selection = null;
     applyActiveSelection();
-    listTitle.innerHTML = 'All articles';
-    btnMarkAllRead.style.display = 'inline-flex';
-    btnMarkAllRead.onclick = () => markAllRead('all', 'all');
-    await loadItems(() => api('folder_items', { params: { folder_id: 'all' } }), opts);
+    listTitle.innerHTML = 'Select a folder or feed';
+    listCount.textContent = '';
+    btnMarkAllRead.style.display = 'none';
+    state.items = [];
+    articleList.innerHTML = '';
+    contentScroll.innerHTML = `<div class="empty-state" id="content-empty"><h3>No article selected</h3><p>Click an article in the list above to read it here.</p></div>`;
   }
 
   async function selectFolder(id, name, opts = {}) {
@@ -2152,7 +2296,7 @@ a { color: var(--accent); }
             <span>${fmtDateLong(item.timestamp)}</span>
             <span>·</span>
             <a href="${esc(item.link)}" target="_blank" rel="noopener noreferrer">Open original ↗</a>
-            ${ytId ? `<span>·</span><button class="btn small ghost" id="btn-syncplay" data-yt="${ytId}">▶ Syncplay</button>` : ''}
+            ${ytId ? `<span>·</span><button class="btn small ghost" id="btn-syncplay" data-yt="${ytId}">▶ Syncplay</button><button class="btn small ghost" id="btn-syncplay-add" data-yt="${ytId}" data-title="${esc(item.title)}">+ Playlist</button>` : ''}
           </div>
         </div>
         <div class="article-body">${item.content || '<p style="color:var(--text-faint)">No content could be fetched for this article.</p>'}</div>
@@ -2160,6 +2304,8 @@ a { color: var(--accent); }
     `;
     const syncBtn = document.getElementById('btn-syncplay');
     if (syncBtn) syncBtn.addEventListener('click', () => startSyncplay(syncBtn.dataset.yt));
+    const syncAddBtn = document.getElementById('btn-syncplay-add');
+    if (syncAddBtn) syncAddBtn.addEventListener('click', () => addToSyncplayPlaylist(syncAddBtn.dataset.yt, syncAddBtn.dataset.title));
   }
 
   contentScroll.addEventListener('click', (e) => {
@@ -2296,8 +2442,7 @@ a { color: var(--accent); }
 
   function reselectCurrent() {
     if (!state.selection) return;
-    if (state.selection.type === 'all') selectAll({ silent: true });
-    else if (state.selection.type === 'folder') {
+    if (state.selection.type === 'folder') {
       const f = state.folders.find(x => x.id === state.selection.id);
       selectFolder(state.selection.id, f ? f.name : '', { silent: true });
     } else if (state.selection.type === 'feed') selectFeed(state.selection.id, { silent: true });
@@ -2417,11 +2562,11 @@ a { color: var(--accent); }
   // ---------------- Init ----------------
 
   loadTree().then(() => {
-    // Open "All articles" as the start view if there are feeds.
-    if (state.feeds.length > 0) selectAll();
   }).catch(err => {
     treeScroll.innerHTML = `<div class="empty-sidebar">Could not load: ${esc(err.message)}</div>`;
   });
+  loadSyncplayPlaylist();
+  setInterval(loadSyncplayPlaylist, 4000);
 
   // ---------------- Syncplay (YouTube, synced across connected clients) ----------------
 
@@ -2429,17 +2574,17 @@ a { color: var(--accent); }
   let syncplayRev = -1;
   let syncplayPlayer = null;
   let syncplayReady = false;
-  let syncplaySuppressUntil = 0; // ignorera lokala onStateChange-eko från våra egna seeks tills denna tidpunkt
-  let syncplayCorrectionTargetState = null; // vilket state EKOT av vår senaste rättning förväntas landa i — skiljer äkta eko från en ny, äkta åtgärd i samma fönster
-  let syncplayLocalActionUntil = 0; // vi agerade precis själva (play/paus/seek/stäng) — hindra en redan pågående poll med gammal data från att slåss mot vår färska ändring
+  let syncplaySuppressUntil = 0; // ignore local onStateChange echoes from our own seeks until this time
+  let syncplayCorrectionTargetState = null; // which state the ECHO of our latest correction is expected to land in — distinguishes a real echo from a genuine new action in the same window
+  let syncplayLocalActionUntil = 0; // we just acted ourselves (play/pause/seek/close) — stop an already-in-flight poll with stale data from fighting our fresh change
   let syncplayYtApiPromise = null;
-  let syncplayClockOffset = null; // uppskattad (server_time - klienttid), sekunder
-  let syncplayPendingState = null; // senaste fjärr-state innan spelaren var redo
-  let syncplayCurrentVideoId = null; // vilket videoId som är öppet just nu — används av heartbeat
-  let syncplayLastServerClientId = null; // client_id från senaste poll — vem som är "källa" just nu
-  let syncplayEstimatedOneWayLatencyMs = 50; // rullande skattning, halva RTT
-  let syncplayNudging = false; // hysteres: undviker att farten studsar runt tröskeln
-  let syncplayManualOffsetMs = parseInt(localStorage.getItem('rss_syncplay_offset_ms') || '0', 10) || 0; // fast kalibrering — kompenserar skärmens egen avkodnings-/panellatens, inte nätverksdrift
+  let syncplayClockOffset = null; // estimated (server_time - client time), seconds
+  let syncplayPendingState = null; // latest remote state received before the player was ready
+  let syncplayCurrentVideoId = null; // which videoId is open right now — used by the heartbeat
+  let syncplayLastServerClientId = null; // client_id from the latest poll — who's the "source" right now
+  let syncplayEstimatedOneWayLatencyMs = 50; // rolling estimate, half of RTT
+  let syncplayNudging = false; // hysteresis: avoids the rate bouncing around the threshold
+  let syncplayManualOffsetMs = parseInt(localStorage.getItem('rss_syncplay_offset_ms') || '0', 10) || 0; // fixed calibration — compensates for the screen's own decode/panel latency, not network drift
 
   function loadYoutubeApi() {
     if (syncplayYtApiPromise) return syncplayYtApiPromise;
@@ -2458,9 +2603,9 @@ a { color: var(--accent); }
     const clientNow = Date.now() / 1000;
     const serverNow = syncplayClockOffset === null ? data.now : clientNow + syncplayClockOffset;
     const elapsed = data.playing ? Math.max(0, serverNow - data.server_time) : 0;
-    // Manuell offset kompenserar FAST latens i just DEN HÄR skärmens
-    // avkodnings-/panelkedja (t.ex. TV-processing) — sånt koden aldrig kan
-    // mäta, för det händer efter att bilden lämnat webbläsaren.
+    // Manual offset compensates for FIXED latency in THIS SPECIFIC screen's
+    // decode/panel chain (e.g. TV processing) — something the code can never
+    // measure, since it happens after the frame has left the browser.
     return data.position + elapsed + (syncplayManualOffsetMs / 1000);
   }
 
@@ -2474,28 +2619,23 @@ a { color: var(--accent); }
     localStorage.setItem('rss_syncplay_offset_ms', String(syncplayManualOffsetMs));
     const label = document.getElementById('syncplay-offset-label');
     if (label) label.textContent = syncplayFormatOffset(syncplayManualOffsetMs);
-  }
-
-  let syncplayLastSeekAt = 0;
-
-  // Körs på VARJE poll (inte bara vid ny rev) så drift korrigeras löpande
-  // under uppspelning, inte bara direkt efter någons play/paus/spola.
-  // Seek-cooldown förhindrar att vi hackar sönder uppspelningen genom
-  // att ständigt seeka mot en keyframe som i sig ligger en bit fel.
-
-  const SYNCPLAY_SEEK_DRIFT = 2;      // sekunder — över denna gräns: hård seek
-  const SYNCPLAY_NUDGE_START = 0.08;  // sekunder — börja knuffa farten över denna gräns
-  const SYNCPLAY_NUDGE_STOP = 0.03;   // sekunder — sluta knuffa under denna gräns (hysteres mot studs)
-
-  // YouTube-spelaren accepterar bara vissa uppspelningshastigheter (oftast
-  // 0.75/1/1.25 osv). Kan inte be om t.ex. 1.05x — tar närmaste tillgängliga
-  // rate över/under 1x istället.
-  function syncplayPickNudgeRate(speedUp) {
+  }  let syncplayLastSeekAt = 0;
+  // Runs on EVERY poll (not just on a new rev) so drift is corrected continuously
+  // during playback, not just right after someone's play/pause/seek.
+  // Seek cooldown prevents us from chopping up playback by
+  // constantly seeking to a keyframe that's itself slightly off.
+  const SYNCPLAY_SEEK_DRIFT = 2;      // seconds — above this threshold: hard seek
+  const SYNCPLAY_NUDGE_START = 0.08;  // seconds — start nudging the rate above this threshold
+  const SYNCPLAY_NUDGE_STOP = 0.03;   // seconds — stop nudging below this threshold (hysteresis against bouncing)
+  // The YouTube player only accepts certain playback rates (usually
+  // 0.75/1/1.25 etc). Can't request e.g. 1.05x — takes the nearest available
+  // rate above/below 1x instead.
+function syncplayPickNudgeRate(speedUp) {
     let rates = [0.75, 1, 1.25];
     try {
       const avail = syncplayPlayer.getAvailablePlaybackRates();
       if (avail && avail.length) rates = avail;
-    } catch (e) { /* fall tillbaka på standardlistan */ }
+    } catch (e) { /* fall back to the default list */ }
     const candidates = speedUp ? rates.filter(r => r > 1) : rates.filter(r => r < 1);
     if (!candidates.length) return 1;
     return speedUp ? Math.min(...candidates) : Math.max(...candidates);
@@ -2504,28 +2644,28 @@ a { color: var(--accent); }
   function syncplayApplyState(data) {
     if (!syncplayPlayer || !syncplayReady) { syncplayPendingState = data; return; }
     const pState = syncplayPlayer.getPlayerState();
-    if (pState === YT.PlayerState.BUFFERING) return; // slåss inte mot en pågående seek
+    if (pState === YT.PlayerState.BUFFERING) return; // don't fight an in-progress seek
     const expected = syncplayExpectedPosition(data);
     const current = syncplayPlayer.getCurrentTime();
     const targetState = data.playing ? YT.PlayerState.PLAYING : YT.PlayerState.PAUSED;
 
-    // Alla klienter (även den som senast styrde videon) seekar mot samma
-    // beräknade tidsstämpel. Då snappar alla till SAMMA keyframe istället
-    // för att bara mottagaren kvantiseras medan källan förblir okvantiserad
-    // — vilket annars gör att de aldrig riktigt möts.
-    const drift = expected - current; // positiv = vi ligger efter, negativ = vi ligger före
+    // All clients (even the one that last controlled the video) seek toward the
+    // same calculated timestamp. That way everyone snaps to the SAME keyframe
+    // instead of only the receiver being quantized while the source stays
+    // unquantized — which otherwise means they never truly converge.
+    const drift = expected - current; // positive = we're behind, negative = we're ahead
     const canSeek = Date.now() - syncplayLastSeekAt > 2500;
     if (Math.abs(drift) > SYNCPLAY_SEEK_DRIFT && canSeek) {
-      // Stor drift: bara då är en hörbar seek värt det.
+      // Large drift: only then is an audible seek worth it.
       syncplayLastSeekAt = Date.now();
-      syncplaySuppressUntil = Date.now() + 2500; // seek + buffringstid
-      syncplayCorrectionTargetState = targetState; // vad EKOT förväntas bli — skiljer eko från en riktig ny åtgärd
+      syncplaySuppressUntil = Date.now() + 2500; // seek + buffering time
+      syncplayCorrectionTargetState = targetState; // what the ECHO is expected to be — distinguishes echo from a genuine new action
       syncplayPlayer.seekTo(expected, true);
       syncplayPlayer.setPlaybackRate(1);
       syncplayNudging = false;
     } else {
-      // Hysteres: starta knuff över START, sluta först under STOP.
-      // Utan glapp studsar farten fram och tillbaka runt en enda tröskel.
+      // Hysteresis: start nudging above START, only stop below STOP.
+      // Without the gap the rate would bounce back and forth around a single threshold.
       if (Math.abs(drift) > SYNCPLAY_NUDGE_START) syncplayNudging = true;
       else if (Math.abs(drift) < SYNCPLAY_NUDGE_STOP) syncplayNudging = false;
 
@@ -2556,11 +2696,12 @@ a { color: var(--accent); }
     overlay.id = 'syncplay-overlay';
     overlay.innerHTML = `
       <div class="syncplay-box">
-        <button class="syncplay-close" id="syncplay-close-btn" title="Stäng för alla">✕</button>
+        <button class="syncplay-close" id="syncplay-close-btn" title="Close for everyone">✕</button>
+        <button class="syncplay-skip" id="syncplay-skip-btn" title="Skip to next video">⏭ Skip</button>
         <div id="syncplay-offset-ctrl" style="position:absolute;bottom:10px;right:10px;z-index:6;background:rgba(20,22,28,.75);color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:4px 6px;font-size:11px;display:flex;align-items:center;gap:4px;">
-          <button id="syncplay-offset-minus" title="Justera bakåt" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">−</button>
+          <button id="syncplay-offset-minus" title="Adjust backward" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">−</button>
           <span id="syncplay-offset-label">${syncplayFormatOffset(syncplayManualOffsetMs)}</span>
-          <button id="syncplay-offset-plus" title="Justera framåt" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">+</button>
+          <button id="syncplay-offset-plus" title="Adjust forward" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:13px;padding:2px 6px;">+</button>
         </div>
         <div id="syncplay-player"></div>
       </div>
@@ -2571,6 +2712,7 @@ a { color: var(--accent); }
       syncplaySet({ active: false, video_id: videoId, playing: false, position: 0 });
       closeSyncplayOverlay();
     });
+    document.getElementById('syncplay-skip-btn').addEventListener('click', skipSyncplayVideo);
     document.getElementById('syncplay-offset-minus').addEventListener('click', () => syncplayAdjustOffset(-20));
     document.getElementById('syncplay-offset-plus').addEventListener('click', () => syncplayAdjustOffset(20));
     syncplayPlayer = new YT.Player('syncplay-player', {
@@ -2582,10 +2724,14 @@ a { color: var(--accent); }
           if (syncplayPendingState) { syncplayApplyState(syncplayPendingState); syncplayPendingState = null; }
         },
         onStateChange: (e) => {
-          // Svälj bara om det ser ut som EKOT av vår egen senaste rättning
-          // (samma state vi själva precis tvingade fram). En äkta åtgärd åt
-          // andra hållet ska alltid slippa igenom, även mitt i fönstret —
-          // annars kan bara källan någonsin styra videon.
+          if (e.data === YT.PlayerState.ENDED) {
+            syncplayHandleEnded(videoId);
+            return;
+          }
+          // Only swallow it if it looks like the ECHO of our own latest
+          // correction (the same state we just forced). A genuine action
+          // in the other direction should always get through, even mid-window
+          // — otherwise only the source could ever control the video.
           if (Date.now() < syncplaySuppressUntil && e.data === syncplayCorrectionTargetState) return;
           if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) {
             syncplayLocalActionUntil = Date.now() + 1200;
@@ -2610,9 +2756,9 @@ a { color: var(--accent); }
   }
 
   async function syncplaySet(opts) {
-    // Position mäts lokalt FÖRE fetch, men servern stämplar server_time vid
-    // MOTTAGANDET. Utan kompensation ligger varje följare konsekvent en
-    // nätverkslatens FÖRE värdens riktiga tidpunkt.
+    // Position is measured locally BEFORE the fetch, but the server stamps
+    // server_time on RECEIPT. Without compensation every follower would
+    // consistently lag one network latency BEHIND the value's true timestamp.
     const latencyCompensatedPosition = opts.playing
       ? (opts.position || 0) + (syncplayEstimatedOneWayLatencyMs / 1000)
       : (opts.position || 0);
@@ -2624,15 +2770,37 @@ a { color: var(--accent); }
         position: String(latencyCompensatedPosition),
         client_id: syncplayClientId,
         heartbeat: opts.heartbeat ? '1' : '0',
-      }});
-      syncplayRev = res.rev;
+      }});      syncplayRev = res.rev;
     } catch (e) { toast('Syncplay error: ' + e.message); }
   }
-
-  function startSyncplay(videoId) {
+  async function syncplayAdvancePlaylist(videoId) {
     syncplayLocalActionUntil = Date.now() + 1200;
+    try {
+      const res = await api('syncplay_playlist_advance', { method: 'POST', body: { video_id: videoId } });
+      state.syncplayPlaylist = res.items || [];
+      renderSyncplaySection();
+      if (res.next) {
+        closeSyncplayOverlay();
+        syncplaySet({ active: true, video_id: res.next.video_id, playing: true, position: 0 });
+        openSyncplayOverlay(res.next.video_id, false);
+      } else {
+        syncplaySet({ active: false, video_id: videoId, playing: false, position: 0 });
+        closeSyncplayOverlay();
+      }
+    } catch (e) { toast('Syncplay error: ' + e.message); }
+  }
+  async function syncplayHandleEnded(videoId) {
+    if (syncplayLastServerClientId !== syncplayClientId) return; // only the source advances the list on video end
+    syncplayAdvancePlaylist(videoId);
+  }
+  function skipSyncplayVideo() {
+    if (!syncplayCurrentVideoId) return;
+    syncplayAdvancePlaylist(syncplayCurrentVideoId);
+  }
+  function startSyncplay(videoId) {
+syncplayLocalActionUntil = Date.now() + 1200;
     syncplaySet({ active: true, video_id: videoId, playing: true, position: 0 });
-    // Riktig klick-gest just nu -> webbläsaren tillåter autoplay MED ljud.
+    // Real click gesture just happened -> the browser allows autoplay WITH sound.
     openSyncplayOverlay(videoId, false);
   }
 
@@ -2642,8 +2810,9 @@ a { color: var(--accent); }
     try { data = await api('syncplay_get'); } catch (e) { return; }
     const reqEnd = Date.now();
 
-    // Kompensera för tur-och-retur: anta server_time gäller vid request-MITTEN,
-    // inte vid svarets ankomst — annars byggs halva RTT in som permanent fel.
+    // Compensate for round-trip: assume server_time applies at the MIDPOINT
+    // of the request, not at the response's arrival — otherwise half the RTT
+    // gets baked in as a permanent error.
     const midClientTime = (reqStart + reqEnd) / 2000;
     const offsetSample = data.now - midClientTime;
     syncplayClockOffset = syncplayClockOffset === null ? offsetSample : (syncplayClockOffset * 0.8 + offsetSample * 0.2);
@@ -2652,31 +2821,27 @@ a { color: var(--accent); }
     syncplayRev = data.rev;
     syncplayLastServerClientId = data.client_id;
 
-    // Vi agerade precis själva (play/paus/seek/stäng) — invänta att den
-    // egna skrivningen hinner landa innan vi reagerar på polldata.
+    // We just acted ourselves (play/pause/seek/close) — wait for our own
+    // write to land before reacting to poll data.
     if (Date.now() < syncplayLocalActionUntil) return;
 
     if (!data.active) { closeSyncplayOverlay(); return; }
     if (!document.getElementById('syncplay-overlay')) { await openSyncplayOverlay(data.video_id); }
 
-    // Källan (den som senast styrde videon) korrigerar aldrig sig själv —
-    // det var det som orsakade loopen. Bara mottagande klienter synkas mot den.
+    // The source (the one who last controlled the video) never corrects
+    // itself — that's what caused the loop. Only receiving clients sync to it.
     if (data.client_id === syncplayClientId) return;
 
     syncplayApplyState(data);
-  }
-
-  setInterval(pollSyncplay, 250); // tätare poll = kortare fönster innan drift upptäcks
-
-  const SYNCPLAY_HEARTBEAT_MS = 500; // matchar tätare poll, håller server-state färsk
-
-  // Håller server-state färsk medan videon spelas, inte bara vid play/paus/seek.
-  // Utan denna extrapolerar följarna rakt fram tills nästa event — buffrar
-  // källan syns det inte förrän långt senare och drift byggs upp obemärkt.
+  }  setInterval(pollSyncplay, 250); // tighter poll = shorter window before drift is detected
+  const SYNCPLAY_HEARTBEAT_MS = 500; // matches the tighter poll, keeps server state fresh
+  // Keeps server state fresh while the video plays, not just on play/pause/seek.
+  // Without this, followers extrapolate straight ahead until the next event — if the
+  // source buffers, it won't show up until much later and drift builds up unnoticed.
   function syncplayHeartbeat() {
     if (!syncplayPlayer || !syncplayReady || !syncplayCurrentVideoId) return;
-    if (syncplayLastServerClientId !== syncplayClientId) return; // bara källan hjärtslår
-    if (syncplayPlayer.getPlayerState() !== YT.PlayerState.PLAYING) return;
+    if (syncplayLastServerClientId !== syncplayClientId) return; // only the source sends heartbeats
+if (syncplayPlayer.getPlayerState() !== YT.PlayerState.PLAYING) return;
     syncplaySet({
       active: true,
       video_id: syncplayCurrentVideoId,
