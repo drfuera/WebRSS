@@ -734,7 +734,7 @@ if (isset($_GET['api'])) {
         json_out(['ok' => true, 'rev' => $syncData['rev']]);
     }
 
-    if (in_array($action, ['syncplay_playlist_get','syncplay_playlist_add','syncplay_playlist_delete','syncplay_playlist_advance'], true)) {
+    if (in_array($action, ['syncplay_playlist_get','syncplay_playlist_add','syncplay_playlist_delete','syncplay_playlist_advance','syncplay_playlist_reorder'], true)) {
         $plLockFh = @fopen(SYNCPLAY_PLAYLIST_FILE . '.lock', 'c+');
         if ($plLockFh !== false) flock($plLockFh, LOCK_EX);
         $playlist = read_json_file(SYNCPLAY_PLAYLIST_FILE, ['items' => []]);
@@ -783,6 +783,19 @@ if (isset($_GET['api'])) {
                 write_json_file(SYNCPLAY_PLAYLIST_FILE, $playlist);
                 $next = $playlist['items'][0] ?? null;
                 json_out(['items' => $playlist['items'], 'next' => $next]);
+            }
+            case 'syncplay_playlist_reorder': {
+                $ids = array_filter(explode(',', (string)($_POST['ids'] ?? '')), fn($v) => $v !== '');
+                $byId = [];
+                foreach ($playlist['items'] as $it) $byId[$it['id']] = $it;
+                $reordered = [];
+                foreach ($ids as $id) {
+                    if (isset($byId[$id])) { $reordered[] = $byId[$id]; unset($byId[$id]); }
+                }
+                foreach ($byId as $rest) $reordered[] = $rest;
+                $playlist['items'] = $reordered;
+                write_json_file(SYNCPLAY_PLAYLIST_FILE, $playlist);
+                json_out($playlist);
             }
         }
     }
@@ -1814,7 +1827,7 @@ function feedRow(f) {
   function iconPlay() { return `<svg width="14" height="14" viewBox="0 0 16 16" style="position:relative;top:3px;"><path d="M4 2.5l9 5.5-9 5.5z" fill="currentColor"/></svg>`; }
   function iconPlus() { return `<svg width="12" height="12" viewBox="0 0 16 16"><path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`; }
   function syncplayItemRow(it) {
-    return `<div class="tree-feed" data-type="syncplay-item" data-id="${it.id}" data-video-id="${it.video_id}">
+    return `<div class="tree-feed" data-type="syncplay-item" data-id="${it.id}" data-video-id="${it.video_id}" draggable="true">
       <span class="tree-icon">${iconFeed()}</span>
       <span class="tree-label" title="${esc(it.title)}">${esc(it.title)}</span>
       <span class="tree-item-actions">
@@ -1825,6 +1838,7 @@ function feedRow(f) {
   function renderSyncplaySection() {
     const container = document.getElementById('syncplay-section');
     if (!container) return;
+    if (dragged && dragged.type === 'syncplay-item') return; // don't yank the DOM node out from under an active drag
     const items = state.syncplayPlaylist || [];
     container.innerHTML = `<div class="folder-group">
       <div class="tree-folder" data-type="syncplay-header">
@@ -1974,12 +1988,22 @@ function feedRow(f) {
 
     const folderRow = e.target.closest('.tree-folder');
     const feedRow = e.target.closest('.tree-feed');
+    const isSyncplayRow = feedRow && feedRow.dataset.type === 'syncplay-item';
+
+    if (dragged.type === 'syncplay-item') {
+      if (isSyncplayRow && feedRow.dataset.id !== dragged.id) {
+        const rect = feedRow.getBoundingClientRect();
+        const before = (e.clientY - rect.top) < rect.height / 2;
+        feedRow.classList.add(before ? 'drop-above' : 'drop-below');
+      }
+      return;
+    }
 
     if (dragged.type === 'feed' && folderRow && folderRow.dataset.id !== dragged.id) {
       folderRow.classList.add('drop-into');
       return;
     }
-    if (feedRow && feedRow.dataset.id !== dragged.id && dragged.type === 'feed') {
+    if (feedRow && !isSyncplayRow && feedRow.dataset.id !== dragged.id && dragged.type === 'feed') {
       const rect = feedRow.getBoundingClientRect();
       const before = (e.clientY - rect.top) < rect.height / 2;
       feedRow.classList.add(before ? 'drop-above' : 'drop-below');
@@ -2003,6 +2027,22 @@ function feedRow(f) {
     const feedRow = e.target.closest('.tree-feed');
 
     try {
+      if (type === 'syncplay-item') {
+        const targetRow = feedRow && feedRow.dataset.type === 'syncplay-item' ? feedRow : null;
+        if (targetRow && targetRow.dataset.id !== id) {
+          const rect = targetRow.getBoundingClientRect();
+          const before = (e.clientY - rect.top) < rect.height / 2;
+          const order = (state.syncplayPlaylist || []).map(it => it.id);
+          const draggedIdx = order.indexOf(id);
+          if (draggedIdx !== -1) order.splice(draggedIdx, 1);
+          let targetIdx = order.indexOf(targetRow.dataset.id);
+          if (!before) targetIdx += 1;
+          order.splice(targetIdx, 0, id);
+          await api('syncplay_playlist_reorder', { method: 'POST', body: { ids: order.join(',') } });
+          await loadSyncplayPlaylist();
+        }
+        return;
+      }
       if (type === 'feed') {
         if (folderRow && folderRow.dataset.id !== id) {
           await api('move_feed', { method: 'POST', body: { id, folder_id: folderRow.dataset.id } });
