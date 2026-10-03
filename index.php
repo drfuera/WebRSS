@@ -154,8 +154,21 @@ function bad_request(string $msg): void {
 // HTTP FETCHING
 // ---------------------------------------------------------------------------
 
+function is_youtube_url(string $url): bool {
+    return in_array(strtolower((string)parse_url($url, PHP_URL_HOST)),
+        ['www.youtube.com', 'youtube.com', 'm.youtube.com', 'music.youtube.com'], true);
+}
+
+// YouTube redirects EU IPs to a cookie-consent interstitial instead of the real
+// page; this cookie skips it so channel pages can actually be parsed.
+function youtube_consent_headers(string $url): array {
+    if (!is_youtube_url($url)) return [];
+    return ['Cookie: CONSENT=YES+cb; SOCS=CAI'];
+}
+
 function http_get(string $url): string {
     $ua = 'Mozilla/5.0 (compatible; PrivateRSSReader/1.0; +self-hosted)';
+    $extraHeaders = youtube_consent_headers($url);
 
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
@@ -169,7 +182,7 @@ function http_get(string $url): string {
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-            CURLOPT_HTTPHEADER => ['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'], $extraHeaders),
         ]);
         $body = curl_exec($ch);
         $errno = curl_errno($ch);
@@ -188,7 +201,7 @@ function http_get(string $url): string {
     $ctx = stream_context_create([
         'http' => [
             'timeout' => FETCH_TIMEOUT,
-            'header' => "User-Agent: $ua\r\nAccept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8\r\n",
+            'header' => "User-Agent: $ua\r\nAccept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8\r\n" . ($extraHeaders ? implode("\r\n", $extraHeaders) . "\r\n" : ''),
             'follow_location' => 1,
             'max_redirects' => 5,
         ],
@@ -225,6 +238,7 @@ function http_get_multi(array $urls): array {
     $handles = [];
     foreach ($urls as $url) {
         $ch = curl_init($url);
+        $ytHeaders = youtube_consent_headers($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
@@ -235,7 +249,7 @@ function http_get_multi(array $urls): array {
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-            CURLOPT_HTTPHEADER => ['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.8'], $ytHeaders),
         ]);
         curl_multi_add_handle($mh, $ch);
         $handles[$url] = $ch;
@@ -303,6 +317,95 @@ function discover_feed_url(string $html, string $baseUrl): ?string {
         }
     }
     return null;
+}
+
+// Maps a YouTube channel/playlist page URL to its RSS feed URL.
+//  - /channel/UC… and /playlist?list=… are mapped directly, no page fetch needed.
+//  - @handle, /c/…, /user/… require fetching the channel page to dig out the
+//    channel id — YouTube pages carry no RSS autodiscovery <link> tags, so the
+//    generic discover_feed_url() can't find them. That's why this exists.
+// Returns null for anything that isn't a YouTube page we can map.
+function youtube_feed_url(string $url, ?string $html = null): ?string {
+    if (!is_youtube_url($url)) return null;
+    $path = (string)(parse_url($url, PHP_URL_PATH) ?: '');
+
+    // Channel id right in the URL — build the feed URL directly.
+    if (preg_match('#^/channel/(UC[a-zA-Z0-9_-]{22})#', $path, $m)) {
+        return 'https://www.youtube.com/feeds/videos.xml?channel_id=' . $m[1];
+    }
+
+    // Playlist id in the query string — build the feed URL directly.
+    if ($path === '/playlist') {
+        parse_str((string)parse_url($url, PHP_URL_QUERY), $q);
+        if (!empty($q['list']) && preg_match('/^(?:PL|UU|OL|FL|LL)[A-Za-z0-9_-]{10,}$/', $q['list'])) {
+            return 'https://www.youtube.com/feeds/videos.xml?playlist_id=' . $q['list'];
+        }
+    }
+
+    // @handle, /c/name, /user/name (optionally with a tab like /videos) —
+    // fetch the channel page and extract the channel id from its source.
+    if (preg_match('#^/(?:@[^/]+|c/[^/]+|user/[^/]+)(?:/[^/]+)*/?$#', $path)) {
+        if ($html === null) {
+            try {
+                $html = http_get($url);
+            } catch (Throwable $e) {
+                return null;
+            }
+        }
+        // The channel id (UC…) shows up in several places in the page source —
+        // try the JSON blobs first, then any /channel/UC… link as a catch-all.
+        foreach ([
+            '/"channelId":"(UC[a-zA-Z0-9_-]{22})"/',
+            '/"externalChannelId":"(UC[a-zA-Z0-9_-]{22})"/',
+            '/"externalId":"(UC[a-zA-Z0-9_-]{22})"/',
+            '/"browseId":"(UC[a-zA-Z0-9_-]{22})"/',
+            '/data-channel-external-id="(UC[a-zA-Z0-9_-]{22})"/',
+            '#youtube\.com/channel/(UC[a-zA-Z0-9_-]{22})#',
+        ] as $re) {
+            if (preg_match($re, $html, $m)) {
+                return 'https://www.youtube.com/feeds/videos.xml?channel_id=' . $m[1];
+            }
+        }
+    }
+    return null;
+}
+
+// Cheap sniff: does this content look like an HTML page rather than an XML feed?
+function looks_like_html(string $body): bool {
+    $head = strtolower(substr(ltrim($body), 0, 2048));
+    if (strpos($head, '<rss') !== false || strpos($head, '<feed') !== false || strpos($head, '<rdf:rdf') !== false) {
+        return false; // feed markers win over any HTML-ish content further down
+    }
+    return strpos($head, '<!doctype html') !== false
+        || strpos($head, '<html') !== false
+        || strpos($head, '<head') !== false
+        || strpos($head, '<body') !== false;
+}
+
+/**
+ * Resolves whatever the user pasted into the actual feed URL, so that page
+ * addresses (a YouTube channel, a blog's front page, …) get stored as real
+ * feed URLs. Returns [feedUrl, bodyOrNull] — bodyOrNull is set when the
+ * address already pointed at the feed itself, letting the caller skip
+ * re-fetching it. Throws when the address can't be fetched or contains no
+ * findable feed.
+ */
+function resolve_feed_url(string $url): array {
+    // YouTube first: channel/playlist/handle URLs map to a known feed format.
+    $yt = youtube_feed_url($url); // fetches the channel page itself for @handle-style URLs
+    if ($yt !== null) return [$yt, null];
+
+    $body = http_get($url); // throws on network/HTTP errors
+    if (looks_like_html($body)) {
+        // A normal web page — look for RSS autodiscovery <link> tags in its source.
+        $feedUrl = discover_feed_url($body, $url);
+        if ($feedUrl === null) {
+            throw new RuntimeException('No RSS/Atom feed could be found for that address.');
+        }
+        return [$feedUrl, null];
+    }
+    // Not HTML — assume it's already the feed itself (refresh_feed will verify).
+    return [$url, $body];
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +684,9 @@ function refresh_feed(array &$feedMeta, ?string $prefetchedBody = null, ?string 
         try {
             $parsed = parse_feed_xml($body);
         } catch (Throwable $xmlErr) {
-            $discovered = discover_feed_url($body, $url);
+            // Not a feed — maybe a normal page (e.g. a YouTube channel). Try to
+            // find the real feed URL in the page source and use that instead.
+            $discovered = youtube_feed_url($url, $body) ?? discover_feed_url($body, $url);
             if ($discovered === null) throw $xmlErr;
             $body = http_get($discovered);
             $parsed = parse_feed_xml($body);
@@ -881,6 +986,14 @@ if (isset($_GET['api'])) {
                 if ($url === '' || !preg_match('#^https?://#i', $url)) {
                     bad_request('Enter a valid http(s) URL.');
                 }
+                // The user may paste a normal page address (e.g. a YouTube channel) —
+                // resolve it to the real feed URL first, so duplicates are detected on
+                // the actual feed address and the feed is stored with it from the start.
+                try {
+                    [$url, $prefetchedBody] = resolve_feed_url($url);
+                } catch (Throwable $e) {
+                    bad_request($e->getMessage());
+                }
                 foreach ($db['feeds'] as $f) {
                     if ($f['url'] === $url) bad_request('That feed has already been added.');
                 }
@@ -895,7 +1008,12 @@ if (isset($_GET['api'])) {
                     'error' => null,
                 ];
 
-                $items = refresh_feed($feed);
+                $items = refresh_feed($feed, $prefetchedBody ?? null);
+                if (!empty($feed['error'])) {
+                    // Don't store a feed that couldn't be read at all — show the
+                    // reason right away instead of a permanently broken entry.
+                    bad_request('Could not read the feed: ' . $feed['error']);
+                }
                 $db['feeds'][] = $feed;
                 save_feeds_db($db);
                 json_out(['ok' => true, 'feed' => $feed, 'item_count' => count($items)]);
@@ -912,6 +1030,13 @@ if (isset($_GET['api'])) {
                 $db['feeds'][$idx]['title'] = $title;
                 $db['feeds'][$idx]['custom_title'] = true;
                 if ($url !== '' && $url !== $db['feeds'][$idx]['url']) {
+                    // Same resolution as add_feed: a pasted page URL (e.g. a YouTube
+                    // channel) becomes the real feed URL before it is stored.
+                    try {
+                        [$url] = resolve_feed_url($url);
+                    } catch (Throwable $e) {
+                        bad_request($e->getMessage());
+                    }
                     foreach ($db['feeds'] as $f) {
                         if ($f['id'] !== $id && $f['url'] === $url) bad_request('That feed URL is already added.');
                     }
@@ -964,6 +1089,7 @@ if (isset($_GET['api'])) {
                 $idx = find_feed($db, $id);
                 if ($idx === null) bad_request('Feed not found.');
                 $items = get_items_for_feed($db['feeds'][$idx], $refresh);
+                usort($items, fn($a, $b) => ($a['read'] <=> $b['read']) ?: ($b['timestamp'] <=> $a['timestamp']));
                 save_feeds_db($db); // save any updated metadata (last_fetched/error/title)
                 json_out([
                     'ok' => true,
@@ -997,7 +1123,7 @@ if (isset($_GET['api'])) {
                 unset($feedMeta);
                 save_feeds_db($db);
 
-                usort($allItems, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
+                usort($allItems, fn($a, $b) => ($a['read'] <=> $b['read']) ?: ($b['timestamp'] <=> $a['timestamp']));
                 json_out(['ok' => true, 'items' => $allItems]);
             }
 
@@ -1096,7 +1222,7 @@ if (isset($_GET['api'])) {
                         }
                     }
                 }
-                usort($allItems, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
+                usort($allItems, fn($a, $b) => ($a['read'] <=> $b['read']) ?: ($b['timestamp'] <=> $a['timestamp']));
                 json_out(['ok' => true, 'items' => $allItems]);
             }
 
@@ -2412,7 +2538,7 @@ function feedRow(f) {
     const currentFolder = state.selection?.type === 'folder' ? state.selection.id : '';
     const backdrop = openModal(`
       <h2>Add feed</h2>
-      <div class="field"><label>Web address (RSS/Atom, or the page's URL)</label><input type="text" id="m-url" placeholder="https://example.com/feed.xml" autofocus></div>
+      <div class="field"><label>Web address (feed URL, or any page/channel URL)</label><input type="text" id="m-url" placeholder="https://example.com/feed.xml or https://www.youtube.com/@Channel" autofocus></div>
       <div class="field"><label>Folder</label><select id="m-folder">${folderOptions(currentFolder)}</select></div>
       <div class="modal-error" id="m-error"></div>
       <div class="modal-actions">
@@ -2428,10 +2554,11 @@ function feedRow(f) {
       if (!url) { errEl.textContent = 'Enter a URL.'; return; }
       btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Fetching…';
       try {
-        await api('add_feed', { method: 'POST', body: { url, folder_id } });
+        const res = await api('add_feed', { method: 'POST', body: { url, folder_id } });
         backdrop.remove();
         await loadTree();
-        toast('Feed added.');
+        // Show the resolved URL — confirms what the script actually found (e.g. a YouTube channel's feed).
+        toast(res.feed && res.feed.url ? 'Feed added: ' + res.feed.url : 'Feed added.');
       } catch (e) {
         errEl.textContent = e.message;
         btn.disabled = false; btn.textContent = 'Add';
