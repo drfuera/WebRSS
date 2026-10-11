@@ -193,7 +193,7 @@ function http_get(string $url): string {
             throw new RuntimeException('Could not fetch URL: ' . ($err ?: 'unknown error'));
         }
         if ($httpCode >= 400) {
-            throw new RuntimeException('Server responded with HTTP ' . $httpCode);
+            throw new RuntimeException('Server responded with HTTP ' . $httpCode . ' for ' . $url);
         }
         return $body;
     }
@@ -269,7 +269,7 @@ function http_get_multi(array $urls): array {
         if ($errno !== 0 || $body === false) {
             $results[$url] = ['body' => null, 'error' => 'Could not fetch URL: ' . ($err ?: 'unknown error')];
         } elseif ($httpCode >= 400) {
-            $results[$url] = ['body' => null, 'error' => 'Server responded with HTTP ' . $httpCode];
+            $results[$url] = ['body' => null, 'error' => 'Server responded with HTTP ' . $httpCode . ' for ' . $url];
         } else {
             $results[$url] = ['body' => $body, 'error' => null];
         }
@@ -797,7 +797,7 @@ if (isset($_GET['api'])) {
     ensure_data_dir();
 
     // Syncplay has its own small lock-file system — must never wait on the feeds lock,
-    // since it's polled ~every 1.5s by every connected client.
+    // since it's polled every 250ms by every connected client while a session runs.
     if ($action === 'syncplay_get' || $action === 'syncplay_set') {
         $syncLockFh = @fopen(SYNCPLAY_FILE . '.lock', 'c+');
         if ($syncLockFh !== false) flock($syncLockFh, LOCK_EX);
@@ -2856,6 +2856,7 @@ function syncplayPickNudgeRate(speedUp) {
 
   async function openSyncplayOverlay(videoId, startMuted = true) {
     if (document.getElementById('syncplay-overlay')) return;
+    syncplayStartPolling(); // a local open always means a live session
     await loadYoutubeApi();
     syncplayReady = false;
     syncplayCurrentVideoId = videoId;
@@ -2987,6 +2988,7 @@ syncplayLocalActionUntil = Date.now() + 1200;
 
     syncplayRev = data.rev;
     syncplayLastServerClientId = data.client_id;
+    syncplayRemoteActive = !!data.active;
 
     // We just acted ourselves (play/pause/seek/close) — wait for our own
     // write to land before reacting to poll data.
@@ -3000,7 +3002,38 @@ syncplayLocalActionUntil = Date.now() + 1200;
     if (data.client_id === syncplayClientId) return;
 
     syncplayApplyState(data);
-  }  setInterval(pollSyncplay, 250); // tighter poll = shorter window before drift is detected
+  }
+
+  // syncplay_get poll — always running, rate adapts: 250ms while a session
+  // is live (remote reports one active, our overlay is open, or we just
+  // acted locally) for drift correction, 1000ms while idle just to check IF
+  // one has started. An idle device's own poll is what detects a session:
+  // it auto-opens the overlay, and the rate then jumps to 250ms. The delay
+  // is re-decided after every completed poll, and polls never overlap —
+  // each finishes before the next is scheduled, so a slow network can't
+  // pile up parallel requests.
+  const SYNCPLAY_POLL_ACTIVE_MS = 250;
+  const SYNCPLAY_POLL_IDLE_MS = 1000;
+  let syncplayPolling = false;
+  let syncplayRemoteActive = false;
+  function syncplayPollDelay() {
+    return (syncplayRemoteActive
+      || !!document.getElementById('syncplay-overlay')
+      || Date.now() < syncplayLocalActionUntil)
+      ? SYNCPLAY_POLL_ACTIVE_MS : SYNCPLAY_POLL_IDLE_MS;
+  }
+  function syncplayStartPolling() {
+    if (syncplayPolling) return;
+    syncplayPolling = true;
+    (async function loop() {
+      for (;;) {
+        await pollSyncplay();
+        await new Promise(r => setTimeout(r, syncplayPollDelay()));
+      }
+    })();
+  }
+  syncplayStartPolling();
+
   const SYNCPLAY_HEARTBEAT_MS = 500; // matches the tighter poll, keeps server state fresh
   // Keeps server state fresh while the video plays, not just on play/pause/seek.
   // Without this, followers extrapolate straight ahead until the next event — if the
